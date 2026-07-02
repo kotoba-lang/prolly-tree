@@ -1,7 +1,8 @@
 (ns prolly-tree.core-test
   (:require #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
-            [prolly-tree.core :as pt]))
+            [prolly-tree.core :as pt]
+            [ipld.core :as ipld]))
 
 (defn- mem-store []
   (let [store (atom {})]
@@ -45,3 +46,18 @@
         root (pt/build-tree put! entries)
         found (pt/scan-prefix get-fn root "app/")]
     (is (= #{["app/1" 1] ["app/2" 2]} (set found)))))
+
+(deftest internal-children-are-real-ipld-links
+  ;; decode a multi-level tree's root straight off the block store: children
+  ;; must be [max-key <tag-42 Link>], walkable by generic ipld/links with no
+  ;; prolly-specific schema knowledge.
+  (let [{:keys [put! get-fn]} (mem-store)
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+        root (pt/build-tree put! entries)
+        node (ipld/decode (get-fn root))]
+    (is (= "internal" (get node "kind")))
+    (is (seq (ipld/links node)))
+    (is (every? ipld/link? (map second (get node "children"))))
+    ;; every linked CID is fetchable and re-derives its own address
+    (doseq [cid (ipld/links node)]
+      (is (= cid (ipld/cid (get-fn cid)))))))

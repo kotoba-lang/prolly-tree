@@ -18,6 +18,15 @@ Storage is injected, not owned: `put!`/`get-fn` ports are passed in by the
 caller (in-memory atom, IndexedDB, HTTP `block.get`, whatever). This
 namespace does no I/O itself.
 
+Child references in internal nodes are **real IPLD links** — CBOR tag 42
+over the binary CID, via [`kotoba-lang/ipld`](https://github.com/kotoba-lang/ipld)
+— so a generic DAG-CBOR/IPFS tool can walk the tree with no prolly-specific
+schema knowledge (`ipld.core/links` suffices). This replaced the first
+landing's plain-CID-string encoding (its documented honesty note): every
+node's bytes, and therefore every CID, changed — a clean break; nothing in
+production consumed the old format. Boundary math is unchanged (still keyed
+on the child's CID string), so tree shape is identical.
+
 ## Use
 
 ```clojure
@@ -32,15 +41,12 @@ namespace does no I/O itself.
 (pt/scan-prefix get-fn root "a")              ;=> [["a" 1]]
 ```
 
-## Honesty note on portability
+## Scope
 
-`multiformats.core/sha256` and `cbor.core/encode` (this repo's two deps) are
-today JVM-only despite living in `.cljc`/portable-named repos. This
-namespace is itself written portably (`.cljc`, no JVM-only syntax outside
-what it calls), but transitively only runs on the JVM until those two
-upstream repos grow `:cljs` branches. That gap is **not** hidden or worked
-around here — it is a tracked follow-up for the eventual browser/wasm
-target (`kotoba-lang/kotoba-client`).
+Portability is real now, not aspirational: the whole dependency chain
+(`multiformats` → `dag-cbor` → `ipld` → this repo) runs on both the JVM and
+real ClojureScript (shadow-cljs node-test in CI), producing byte-identical
+CIDs on both platforms.
 
 Not in scope for this landing: key-range-pruned scan (current `scan-prefix`
 walks every internal child), tree diff/merge, garbage collection of
@@ -49,7 +55,8 @@ unreferenced nodes.
 ## Test
 
 ```bash
-clojure -M:test
+clojure -M:test                     # JVM
+npm install && npm run test:cljs    # real ClojureScript (shadow-cljs node-test)
 ```
 
 ## License

@@ -20,10 +20,20 @@
   extension -- a genuine gap in this namespace's own portability, not just
   its dependencies' -- now split per-platform. Verified end to end under
   ClojureScript (nbb), not just reasoned about: `build-tree`/`lookup` run
-  and byte-identically match the :clj path for the same input."
+  and byte-identically match the :clj path for the same input.
+
+  Update 2 (tag-42): child references in internal nodes are now REAL IPLD
+  links -- CBOR tag 42 over the binary CID, via `kotoba-lang/ipld` -- not
+  plain CID strings. This closes the honesty note the first landing
+  carried (`cbor.core` had no tag support then; it does now). A generic
+  DAG-CBOR/IPFS tool can walk the tree. NOTE: this changes every node's
+  bytes and therefore every CID -- a clean break, nothing in production
+  consumed the old format (see superproject ADR). Boundary math is
+  unchanged (still keyed on the child's CID string), so tree SHAPE is
+  identical; only the on-block encoding moved."
   (:require [clojure.string :as str]
             [multiformats.core :as mf]
-            [cbor.core :as cbor]))
+            [ipld.core :as ipld]))
 
 (def boundary-bits
   "Chunk boundary fires when the low `boundary-bits` bits of the determinant
@@ -44,13 +54,10 @@
     (zero? (bit-and b (dec (bit-shift-left 1 boundary-bits))))))
 
 (defn- put-node!
-  "CBOR-encode `node`, CID it (dag-cbor codec), call `(put! cid bytes)`,
-  return the cid string."
+  "DAG-CBOR-encode `node` (links become tag 42), CID it, call
+  `(put! cid bytes)`, return the cid string."
   [put! node]
-  (let [bytes (cbor/encode node)
-        cid (mf/cidv1-dag-cbor bytes)]
-    (put! cid bytes)
-    cid))
+  (ipld/put-node! put! node))
 
 (defn- chunk-by
   "Split `items` into chunks; a chunk ends right after any item for which
@@ -82,10 +89,15 @@
 (defn- build-internal-level
   "`child-summaries`: seq of `[max-key cid]`, already sorted by max-key.
   Boundary is determined by the CHILD CID (see namespace docstring), not by
-  max-key."
+  max-key. On-block, each child reference is a real IPLD link (tag 42);
+  in-memory summaries stay plain CID strings so the boundary math is
+  encoding-independent."
   [put! child-summaries]
   (mapv (fn [chunk]
-          (let [node {"kind" "internal" "children" (mapv vec chunk)}
+          (let [node {"kind" "internal"
+                      "children" (mapv (fn [[max-key cid]]
+                                         [max-key (ipld/link cid)])
+                                       chunk)}
                 cid (put-node! put! node)
                 max-key (first (last chunk))]
             [max-key cid]))
@@ -103,7 +115,13 @@
         (recur (build-internal-level put! level))))))
 
 (defn- get-node [get-fn cid]
-  (cbor/decode (get-fn cid)))
+  (ipld/decode (get-fn cid)))
+
+(defn- child-cid
+  "A decoded internal-node child entry is `[max-key <tag-42 link>]`; return
+  the link's CID string."
+  [[_ link]]
+  (ipld/link-cid link))
 
 (defn lookup
   "Point lookup of `k` under `root-cid`, fetching nodes via `(get-fn cid) ->
@@ -117,10 +135,11 @@
           "leaf" (some (fn [[ek ev]] (when (= ek k) ev)) (get node "entries"))
           "internal"
           (let [children (get node "children")
-                target (or (some (fn [[max-key child-cid]]
-                                    (when (<= (compare k max-key) 0) child-cid))
-                                  children)
-                           (second (last children)))]
+                target (or (some (fn [entry]
+                                   (when (<= (compare k (first entry)) 0)
+                                     (child-cid entry)))
+                                 children)
+                           (child-cid (last children)))]
             (recur target)))))))
 
 (defn scan-prefix
@@ -135,6 +154,6 @@
                 (case (get node "kind")
                   "leaf" (filter (fn [[k _]] (str/starts-with? k prefix))
                                  (get node "entries"))
-                  "internal" (mapcat (fn [[_ child-cid]] (walk child-cid))
+                  "internal" (mapcat (fn [entry] (walk (child-cid entry)))
                                      (get node "children")))))]
       (vec (walk root-cid)))))
