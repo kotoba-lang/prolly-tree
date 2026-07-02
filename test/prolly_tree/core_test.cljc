@@ -1,5 +1,6 @@
 (ns prolly-tree.core-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [prolly-tree.core :as pt]))
 
 (defn- mem-store []
@@ -7,6 +8,12 @@
     {:put! (fn [cid bytes] (swap! store assoc cid bytes))
      :get-fn (fn [cid] (get @store cid))
      :store store}))
+
+(defn- key-str
+  "Zero-padded \"key-NNNN\", portable (no `format`, which is :clj-only)."
+  [i]
+  (let [s (str i)]
+    (str "key-" (apply str (repeat (- 4 (count s)) "0")) s)))
 
 (deftest round-trip-small
   (let [{:keys [put! get-fn]} (mem-store)
@@ -19,7 +26,7 @@
 
 (deftest round-trip-many-multi-level
   (let [{:keys [put! get-fn store]} (mem-store)
-        entries (sort-by first (map (fn [i] [(format "key-%04d" i) i]) (range 2000)))
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
         root (pt/build-tree put! entries)]
     (is (some? root))
     (doseq [[k v] entries]
