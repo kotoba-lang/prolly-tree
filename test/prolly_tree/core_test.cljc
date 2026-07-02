@@ -61,3 +61,32 @@
     ;; every linked CID is fetchable and re-derives its own address
     (doseq [cid (ipld/links node)]
       (is (= cid (ipld/cid (get-fn cid)))))))
+
+(deftest scan-prefix-prunes-blocks
+  ;; Range-pruning: a prefix scan must return the SAME matches as before, but
+  ;; fetch far fewer blocks than a full walk (ADR-2607022330 addendum 3 / #16).
+  (let [store (atom {})
+        gets  (atom 0)
+        put!  (fn [cid bytes] (swap! store assoc cid bytes))
+        get-fn (fn [cid] (swap! gets inc) (get @store cid))
+        ;; 3000 keys across 3 prefixes → a multi-level tree with many leaves
+        entries (sort-by first
+                         (for [p ["aaa/" "mmm/" "zzz/"], i (range 1000)]
+                           [(str p (key-str i)) (str "v" i)]))
+        root (pt/build-tree put! entries)
+        total-blocks (count @store)]
+    (testing "correctness: prefix returns exactly its 1000 matches"
+      (let [rows (pt/scan-prefix get-fn root "mmm/")]
+        (is (= 1000 (count rows)))
+        (is (every? (fn [[k _]] (clojure.string/starts-with? k "mmm/")) rows))))
+    (testing "pruning fetches fewer blocks than a full scan"
+      (let [pruned @gets]
+        (reset! gets 0)
+        (pt/scan-prefix get-fn root "")            ; full scan touches every block
+        (let [full @gets]
+          (is (< pruned full)
+              (str "pruned=" pruned " must be < full=" full " (total-blocks=" total-blocks ")")))))
+    (testing "absent prefix fetches only the path, returns nothing"
+      (reset! gets 0)
+      (is (= [] (pt/scan-prefix get-fn root "nope/")))
+      (is (< @gets total-blocks) "absent-prefix scan is pruned, not a full walk"))))
