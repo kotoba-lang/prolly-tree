@@ -14,11 +14,13 @@
   same key, which is an infinite-recursion bug the original Rust
   implementation hit and fixed.
 
-  Honesty note: `multiformats.core/sha256` and `cbor.core/encode` are today
-  JVM-only despite living in `.cljc`/portable-named repos, so this
-  namespace -- while itself written portably -- only actually runs on the
-  JVM until those two grow `:cljs` branches. That is a follow-up, not
-  something this namespace works around or hides."
+  Update: `multiformats.core/sha256` and `cbor.core/encode` have grown real
+  `:cljs` branches (SHA-256 via @noble/hashes, portable CBOR byte buffers).
+  `utf8-bytes` below used `.getBytes` unconditionally despite the `.cljc`
+  extension -- a genuine gap in this namespace's own portability, not just
+  its dependencies' -- now split per-platform. Verified end to end under
+  ClojureScript (nbb), not just reasoned about: `build-tree`/`lookup` run
+  and byte-identically match the :clj path for the same input."
   (:require [clojure.string :as str]
             [multiformats.core :as mf]
             [cbor.core :as cbor]))
@@ -29,8 +31,9 @@
   in the deleted Rust implementation)."
   8)
 
-(defn- utf8-bytes ^bytes [^String s]
-  (.getBytes s "UTF-8"))
+(defn- utf8-bytes [s]
+  #?(:clj (.getBytes ^String s "UTF-8")
+     :cljs (.encode (js/TextEncoder.) s)))
 
 (defn- boundary?
   "True ~1/(2^boundary-bits) of the time: the last byte of

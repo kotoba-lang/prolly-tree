@@ -1,6 +1,6 @@
 {:paths ["src"]
- :deps {io.github.kotoba-lang/multiformats {:git/sha "22f0cf20fc554b12e5baa6d64e7b900983653aac"}
-        io.github.kotoba-lang/dag-cbor {:git/sha "27587ac100f7eb4a9da0ebba5d5efff8ae8f3435"}}
+ :deps {io.github.kotoba-lang/multiformats {:git/sha "11736e9772091699e285284eac3cd80066dded9a"}
+        io.github.kotoba-lang/dag-cbor {:git/sha "720e868396a565066f9938f39d3150cde00bfb4a"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
