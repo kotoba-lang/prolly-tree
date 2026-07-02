@@ -143,17 +143,38 @@
             (recur target)))))))
 
 (defn scan-prefix
-  "All `[k v]` pairs whose string key starts with `prefix`, fetching nodes
-  via `(get-fn cid) -> bytes`. Walks every internal child (no key-range
-  pruning) -- fine for the tree sizes this landing targets; range-pruned
-  scan is a follow-up."
+  "All `[k v]` pairs whose string key starts with `prefix`, fetching nodes via
+  `(get-fn cid) -> bytes`. Key-range pruned: since keys are sorted and an
+  internal node's children are `[max-key cid]` in order, a prefix-matching key
+  can only live in a child whose `max-key >= prefix` AND whose predecessor's
+  `max-key` has not already passed the prefix range. So we skip children entirely
+  below the prefix and stop once past it — descending into O(path) blocks for a
+  keyed read instead of the whole tree (ADR-2607022330 addendum 3 / #16). With an
+  empty `prefix` this is a full ordered scan, unchanged."
   [get-fn root-cid prefix]
   (when root-cid
-    (letfn [(walk [cid]
+    (letfn [(past-prefix? [k]
+              ;; k sorts after the prefix AND is not itself within it → the whole
+              ;; remaining (sorted) range is beyond the prefix; stop.
+              (and (pos? (compare k prefix)) (not (str/starts-with? k prefix))))
+            (walk [cid]
               (let [node (get-node get-fn cid)]
                 (case (get node "kind")
                   "leaf" (filter (fn [[k _]] (str/starts-with? k prefix))
                                  (get node "entries"))
-                  "internal" (mapcat (fn [entry] (walk (child-cid entry)))
-                                     (get node "children")))))]
+                  "internal"
+                  (loop [children (get node "children"), prev-max nil, out (transient [])]
+                    (if (empty? children)
+                      (persistent! out)
+                      (let [entry (first children)
+                            mk (first entry)]
+                        (cond
+                          ;; predecessor already past the prefix range → done
+                          (and (some? prev-max) (past-prefix? prev-max)) (persistent! out)
+                          ;; this child's whole range is below the prefix → skip
+                          (neg? (compare mk prefix)) (recur (rest children) mk out)
+                          ;; may contain matches → descend
+                          :else (recur (rest children) mk
+                                       (reduce conj! out (walk (child-cid entry))))))))))
+              )]
       (vec (walk root-cid)))))
