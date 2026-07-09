@@ -2,7 +2,7 @@
  ;; multiformats stays a direct dep (boundary hashing); node encode/decode
  ;; goes through ipld (tag-42 links), which brings dag-cbor transitively.
  :deps {io.github.kotoba-lang/io-multiformats {:git/sha "eec3ee85c458ea830be94518b9a42f4a8f1aee40"}
-        io.github.kotoba-lang/io-ipld {:git/sha "1e715d1c718376313a12b0e5d4f62eb0cb886aaa"}}
+        io.github.kotoba-lang/io-ipld {:git/sha "4591764514239c4777f227a7a56d46c901e2a4a0"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
