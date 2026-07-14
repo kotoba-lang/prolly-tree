@@ -1,6 +1,6 @@
 (ns prolly-tree.core-test
   (:require #?(:clj [clojure.test :refer [deftest is testing]]
-               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+               :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
             [prolly-tree.core :as pt]
             [ipld.core :as ipld]))
 
@@ -90,3 +90,54 @@
       (reset! gets 0)
       (is (= [] (pt/scan-prefix get-fn root "nope/")))
       (is (< @gets total-blocks) "absent-prefix scan is pruned, not a full walk"))))
+
+#?(:cljs
+   (defn- async-mem-store []
+     (let [store (atom {})
+           gets (atom 0)]
+       {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+        :get-fn (fn [cid] (swap! gets inc) (js/Promise.resolve (get @store cid)))
+        :gets gets
+        :store store})))
+
+#?(:cljs
+   (deftest scan-prefix-async-matches-scan-prefix-correctness
+     (async done
+       (let [{:keys [put! store]} (async-mem-store)
+             sync-get-fn (fn [cid] (get @store cid))
+             async-get-fn (fn [cid] (js/Promise.resolve (get @store cid)))
+             entries (sort-by first
+                              (for [p ["aaa/" "mmm/" "zzz/"], i (range 300)]
+                                [(str p (key-str i)) (str "v" i)]))
+             root (pt/build-tree put! entries)
+             expected (set (pt/scan-prefix sync-get-fn root "mmm/"))]
+         (-> (pt/scan-prefix-async async-get-fn root "mmm/")
+             (.then (fn [rows]
+                      (is (= 300 (count rows)))
+                      (is (= expected (set rows))
+                          "scan-prefix-async returns exactly what scan-prefix returns")
+                      (done))))))))
+
+#?(:cljs
+   (deftest scan-prefix-async-full-scan-matches-and-visits-each-node-once
+     ;; ADR-2607120730 follow-up: the whole point of scan-prefix-async is O(N)
+     ;; node visits (each node fetched/decoded exactly once), not O(N^2) --
+     ;; unlike scan-prefix run over a retry-from-root trampoline (with-blocks),
+     ;; which re-walks/re-decodes every already-fetched node on every retry.
+     (async done
+       (let [{:keys [put! get-fn gets store]} (async-mem-store)
+             sync-get-fn (fn [cid] (get @store cid))
+             entries (sort-by first (map (fn [i] [(key-str i) (str "v" i)]) (range 2000)))
+             root (pt/build-tree put! entries)
+             total-blocks (count @store)
+             expected (set (pt/scan-prefix sync-get-fn root ""))]
+         (reset! gets 0)
+         (-> (pt/scan-prefix-async get-fn root "")
+             (.then (fn [rows]
+                      (is (= 2000 (count rows)))
+                      (is (= expected (set rows))
+                          "scan-prefix-async's full scan matches scan-prefix's full scan exactly")
+                      (is (= total-blocks @gets)
+                          (str "each of the " total-blocks " blocks is fetched EXACTLY once, "
+                               "not re-fetched/re-decoded per retry (actual gets=" @gets ")"))
+                      (done))))))))

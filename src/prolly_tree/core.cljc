@@ -178,3 +178,88 @@
                                        (reduce conj! out (walk (child-cid entry))))))))))
               )]
       (vec (walk root-cid)))))
+
+#?(:cljs
+   (def ^:private scan-prefix-async-batch-size
+     "Max in-flight child fetches at once for `scan-prefix-async`, same
+     rationale/value as `kotobase-peer.core`'s `pmap-async-batch-size`
+     (duplicated here rather than shared -- prolly-tree has no dependency on
+     kotobase-peer, and this codebase's own precedent is per-repo test/
+     concurrency helper duplication over a forced shared dependency in the
+     wrong direction). 24 is a starting point, not load-tested against
+     Workers' exact per-plan subrequest ceiling."
+     24))
+
+#?(:cljs
+   (defn- pmap-async
+     "cljs only: map `f` (returns a `js/Promise`) over `coll` in bounded
+     batches of `scan-prefix-async-batch-size` concurrent calls, return one
+     `js/Promise` of the resolved results, order-preserved. See that var's
+     docstring for why unbounded concurrency is unsafe."
+     [f coll]
+     (let [batches (partition-all scan-prefix-async-batch-size coll)]
+       (reduce (fn [acc-promise batch]
+                 (.then acc-promise
+                        (fn [acc]
+                          (-> (js/Promise.all (into-array (map f batch)))
+                              (.then (fn [batch-results] (into acc batch-results)))))))
+               (js/Promise.resolve [])
+               batches))))
+
+#?(:cljs
+   (defn scan-prefix-async
+     "Async, concurrency-batched counterpart to `scan-prefix`, for a `get-fn`
+     that returns a `js/Promise<bytes>` (fetches over the network, e.g. R2)
+     rather than the synchronous get-fn/block-miss-trampoline contract
+     `scan-prefix` assumes.
+
+     `scan-prefix` over a trampoline like `kotobase.cljc-worker.r2/with-
+     blocks` does exactly ONE new block discovery per call: `get-fn` throws
+     synchronously on the first not-yet-cached CID, the trampoline catches
+     it, fetches JUST THAT block, and re-runs `scan-prefix`'s ENTIRE
+     recursive walk from `root-cid`. Only raw bytes are cached by the
+     trampoline -- `get-node`'s `ipld/decode` is NOT memoized -- so a walk
+     touching N distinct blocks costs O(N) SEQUENTIAL round trips (one
+     discovered per retry, never batched) and, because every retry re-walks
+     and re-decodes every already-fetched node from the root, O(N^2) total
+     node decodes. For a mature tree (thousands of leaf blocks) this
+     quadratic redundant-decode cost, not raw I/O latency, is a plausible
+     dominant contributor to a cold hydrate exceeding a Worker's CPU budget
+     (kotoba-lang/kotobase-peer's `hydrate-db`, gftdcojp/app-aozora#78 /
+     ADR-2607120730).
+
+     `scan-prefix-async` fetches each internal node's children CONCURRENTLY
+     (bounded batch, `pmap-async`) instead of one miss at a time, and decodes
+     each node exactly once (no retry-from-root) -- O(N) round trips
+     (batched, not sequential) and O(N) decodes, not O(N^2). Same key-range
+     pruning as `scan-prefix`; same `[k v]` pair shape.
+
+     get-fn: `(get-fn cid) -> js/Promise<bytes>`. → `js/Promise<[[k v] ...]>`."
+     [get-fn root-cid prefix]
+     (if (nil? root-cid)
+       (js/Promise.resolve [])
+       (letfn [(past-prefix? [k]
+                 (and (pos? (compare k prefix)) (not (str/starts-with? k prefix))))
+               (children-to-walk [node]
+                 (loop [children (get node "children"), prev-max nil, acc []]
+                   (if (empty? children)
+                     acc
+                     (let [entry (first children)
+                           mk (first entry)]
+                       (cond
+                         (and (some? prev-max) (past-prefix? prev-max)) acc
+                         (neg? (compare mk prefix)) (recur (rest children) mk acc)
+                         :else (recur (rest children) mk (conj acc entry)))))))
+               (walk [cid]
+                 (-> (get-fn cid)
+                     (.then ipld/decode)
+                     (.then (fn [node]
+                              (case (get node "kind")
+                                "leaf" (js/Promise.resolve
+                                        (filterv (fn [[k _]] (str/starts-with? k prefix))
+                                                 (get node "entries")))
+                                "internal"
+                                (-> (pmap-async (fn [entry] (walk (child-cid entry)))
+                                                (children-to-walk node))
+                                    (.then (fn [results] (vec (apply concat results))))))))))]
+         (walk root-cid)))))
