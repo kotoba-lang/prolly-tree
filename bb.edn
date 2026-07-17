@@ -1,3 +1,0 @@
-{:tasks
- {test {:doc "Run prolly-tree tests."
-        :task (shell "clojure -M:test")}}}
