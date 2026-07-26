@@ -114,8 +114,16 @@
         (second (first level))
         (recur (build-internal-level put! level))))))
 
+(defn- verified-node [expected-cid bytes]
+  (let [actual (ipld/cid bytes)]
+    (when-not (= expected-cid actual)
+      (throw (ex-info "prolly-tree: block CID mismatch"
+                      {:type :ipld/cid-mismatch :expected-cid expected-cid
+                       :actual-cid actual})))
+    (ipld/decode bytes)))
+
 (defn- get-node [get-fn cid]
-  (ipld/decode (get-fn cid)))
+  (verified-node cid (get-fn cid)))
 
 (defn- child-cid
   "A decoded internal-node child entry is `[max-key <tag-42 link>]`; return
@@ -252,7 +260,7 @@
                          :else (recur (rest children) mk (conj acc entry)))))))
                (walk [cid]
                  (-> (get-fn cid)
-                     (.then ipld/decode)
+                     (.then #(verified-node cid %))
                      (.then (fn [node]
                               (case (get node "kind")
                                 "leaf" (js/Promise.resolve
