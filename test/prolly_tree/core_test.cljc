@@ -47,6 +47,13 @@
         found (pt/scan-prefix get-fn root "app/")]
     (is (= #{["app/1" 1] ["app/2" 2]} (set found)))))
 
+(deftest sync-tree-read-rejects-bytes-stored-under-wrong-cid
+  (let [{:keys [put! get-fn]} (mem-store)
+        root (pt/build-tree put! [["a" 1]])
+        alien (:bytes (ipld/node->block {"kind" "leaf" "entries" [["evil" 9]]}))]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (pt/lookup (fn [cid] (if (= cid root) alien (get-fn cid))) root "a")))))
+
 (deftest internal-children-are-real-ipld-links
   ;; decode a multi-level tree's root straight off the block store: children
   ;; must be [max-key <tag-42 Link>], walkable by generic ipld/links with no
@@ -141,3 +148,17 @@
                           (str "each of the " total-blocks " blocks is fetched EXACTLY once, "
                                "not re-fetched/re-decoded per retry (actual gets=" @gets ")"))
                       (done))))))))
+
+#?(:cljs
+   (deftest async-tree-read-rejects-bytes-stored-under-wrong-cid
+     (async done
+       (let [{:keys [put! store]} (async-mem-store)
+             root (pt/build-tree put! [["a" 1]])
+             alien (:bytes (ipld/node->block {"kind" "leaf" "entries" [["evil" 9]]}))]
+         (-> (pt/scan-prefix-async
+              (fn [cid] (js/Promise.resolve (if (= cid root) alien (get @store cid))))
+              root "")
+             (.then (fn [_] (is false "wrong-CID bytes must reject") (done)))
+             (.catch (fn [e]
+                       (is (= :ipld/cid-mismatch (:type (ex-data e))))
+                       (done))))))))
