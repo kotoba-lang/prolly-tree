@@ -349,49 +349,55 @@
   [v i n replacement]
   (vec (concat (subvec v 0 i) replacement (subvec v (min (count v) (+ i n))))))
 
-(defn- window-end
-  "How many items starting at `i` the rebuild window must cover.
+(defn- leaf-summaries
+  "Every leaf's `[max-key cid]` under `root-cid`, in key order.
 
-  Two, when item `i` is not the last and the ORIGINAL item at `i` ended its
-  chunk (was a boundary): the replacement may not be a boundary, so the chunk
-  would extend into the next one and both must be re-chunked together. One
-  otherwise."
-  [items i boundary-fn]
-  (if (and (< (inc i) (count items)) (boundary-fn (nth items i)))
-    2
-    1))
-
-(defn- insert-at
-  "Insert [k v] under the subtree at `cid` and return that subtree's new
-  [max-key cid] summaries -- one entry normally, more when a chunk split."
-  [put! get-fn cid k v]
-  (let [node (get-node get-fn cid)]
+  Walks internal nodes only. There are ~1/256 as many of those as there are
+  leaves (and ~1/65536 as many again above them), so collecting the whole leaf
+  index costs O(n/256) reads -- for a five-million-entry tree, on the order of
+  eighty blocks rather than twenty thousand."
+  [get-fn root-cid]
+  (let [node (get-node get-fn root-cid)]
     (if (leaf-node? node)
-      (rechunk-leaves put! (upsert-sorted (node-entries node) k v))
-      (let [children (node-children node)
-            i (child-index children k)
-            ;; summaries of the rebuilt SUBTREE, one level down
-            replaced (insert-at put! get-fn (second (nth children i)) k v)
-            ;; this node's own children with that subtree swapped in, then
-            ;; re-chunked into however many nodes the boundaries call for
-            new-children (splice children i 1 replaced)]
-        (rechunk-internal put! new-children)))))
+      [[(first (last (node-entries node))) root-cid]]
+      (into [] (mapcat (fn [[_ cid]]
+                         (let [child (get-node get-fn cid)]
+                           (if (leaf-node? child)
+                             [[(first (last (node-entries child))) cid]]
+                             (leaf-summaries get-fn cid)))))
+            (node-children node)))))
 
 (defn insert
-  "Insert or replace `[k v]` under `root-cid`, writing only the nodes on the
-  affected path via `(put! cid bytes)`, and return the new root CID.
+  "Insert or replace `[k v]` under `root-cid`, writing only the affected leaf
+  and the internal nodes above it, and return the new root CID.
 
-  A nil `root-cid` builds a single-entry tree. Every untouched chunk is shared
-  with the old tree rather than rewritten, which is the difference between an
-  update costing O(log n) blocks and one costing O(n) -- the reason a fold over
-  a large graph currently cannot fit in a Worker's budget.
+  A nil `root-cid` builds a single-entry tree. The result is byte-identical to
+  `(build-tree put! sorted-entries-with-k)` -- the tests treat any divergence
+  as a failure rather than a variant, because a content-addressed store whose
+  insert can produce a tree a rebuild would not is one where two replicas
+  holding identical data disagree about their root hash.
 
-  The result is byte-identical to `(build-tree put! sorted-entries-with-k)`;
-  the tests treat any divergence as a failure rather than a variant."
+  Only ONE leaf is read and rewritten; every other leaf is shared with the old
+  tree. The internal levels are re-chunked in full rather than patched through
+  a window. That is deliberate: boundaries are content-defined, so a
+  replacement whose new CID stops being a boundary must merge its chunk with
+  the following one, and when the affected node is the last child of its
+  parent that sibling lives under a different parent. A window that cannot see
+  past its parent cannot express that merge, and an earlier draft of this
+  function got it wrong in exactly that case. Re-chunking each internal level
+  from the whole ordered summary list is equivalent to what `build-tree` does
+  by construction, and internal nodes are ~1/256 of the tree -- so the cost is
+  a few dozen blocks where a full rebuild pays tens of thousands, and the
+  correctness argument is one sentence instead of a case analysis."
   [put! get-fn root-cid k v]
   (if (nil? root-cid)
     (build-tree put! [[k v]])
-    (loop [level (insert-at put! get-fn root-cid k v)]
-      (if (= 1 (count level))
-        (second (first level))
-        (recur (rechunk-internal put! level))))))
+    (let [leaves (leaf-summaries get-fn root-cid)
+          i (child-index leaves k)
+          leaf (get-node get-fn (second (nth leaves i)))
+          rebuilt (rechunk-leaves put! (upsert-sorted (node-entries leaf) k v))
+          level (splice leaves i 1 rebuilt)]
+      (loop [level level]
+        (if (= 1 (count level))
+          (second (first level))
+          (recur (rechunk-internal put! level)))))))

@@ -17,7 +17,13 @@
      :get-fn (fn [cid] (get @blocks cid))
      :blocks blocks}))
 
-(defn- key-str [n] (str "k" (format "%06d" n)))
+(defn- key-str
+  "Fixed-width so string order matches numeric order. `format` is Clojure-only
+  and this file is .cljc."
+  [n]
+  (let [d (str (Math/abs (long n)))
+        pad (subs "000000" 0 (max 0 (- 6 (count d))))]
+    (str "k" (when (neg? n) "-") pad d)))
 
 (defn- build [put! pairs]
   (pt/build-tree put! (vec (sort-by first pairs))))
