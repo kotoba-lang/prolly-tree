@@ -115,3 +115,52 @@
     (is (= "head" (pt/lookup get-fn root "a-new")))
     (is (= "v250" (pt/lookup get-fn root (key-str 250))))
     (is (nil? (pt/lookup get-fn root "absent")))))
+
+;; ── batch insert ────────────────────────────────────────────────────────────
+
+(deftest insert-many-matches-rebuild
+  (testing "a batch lands the same tree a rebuild of the same content would"
+    (doseq [[size adds] [[0 5] [50 10] [600 60] [2000 150]]]
+      (let [base (mapv (fn [n] [(key-str (* 3 n)) (str "v" n)]) (range size))
+            additions (mapv (fn [n] [(key-str (inc (* 3 n))) (str "a" n)])
+                            (range adds))
+            {:keys [put! get-fn]} (store)
+            root (if (zero? size) nil (build put! base))]
+        (is (= (rebuild-root (concat base additions))
+               (pt/insert-many put! get-fn root additions))
+            (str "size=" size " adds=" adds))))))
+
+(deftest insert-many-matches-a-loop-of-single-inserts
+  (testing "batching is an optimisation, not a different algorithm"
+    (let [base (mapv (fn [n] [(key-str (* 2 n)) (str "v" n)]) (range 400))
+          additions (mapv (fn [n] [(key-str (inc (* 2 n))) (str "a" n)]) (range 40))
+          {:keys [put! get-fn]} (store)]
+      (is (= (insert-root base additions)
+             (pt/insert-many put! get-fn (build put! base) additions))))))
+
+(deftest insert-many-last-write-wins-on-a-repeated-key
+  (let [{:keys [put! get-fn]} (store)
+        base (mapv (fn [n] [(key-str n) (str "v" n)]) (range 100))
+        root (pt/insert-many put! get-fn (build put! base)
+                             [["dup" "first"] ["dup" "second"]])]
+    (is (= "second" (pt/lookup get-fn root "dup")))))
+
+(deftest insert-many-rechunks-the-internal-levels-once
+  (testing "the reason this exists: a loop of single inserts rewrites the
+            internal levels once per entry, which for a fold's novelty costs
+            more than the rebuild it replaces"
+    (let [base (mapv (fn [n] [(key-str n) (str "v" n)]) (range 3000))
+          additions (mapv (fn [n] [(str "zz" n) (str "a" n)]) (range 100))
+          loop-blocks (let [{:keys [put! get-fn blocks]} (store)
+                            root (build put! base)
+                            before (count @blocks)]
+                        (reduce (fn [r [k v]] (pt/insert put! get-fn r k v))
+                                root additions)
+                        (- (count @blocks) before))
+          batch-blocks (let [{:keys [put! get-fn blocks]} (store)
+                             root (build put! base)
+                             before (count @blocks)]
+                         (pt/insert-many put! get-fn root additions)
+                         (- (count @blocks) before))]
+      (is (< batch-blocks loop-blocks)
+          (str "batch wrote " batch-blocks " blocks, loop wrote " loop-blocks)))))

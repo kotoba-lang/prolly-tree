@@ -401,3 +401,56 @@
         (if (= 1 (count level))
           (second (first level))
           (recur (rechunk-internal put! level)))))))
+
+(defn insert-many
+  "Insert or replace many `[k v]` pairs under `root-cid` in one pass, and
+  return the new root CID.
+
+  This is not a convenience wrapper. Calling `insert` in a loop re-chunks the
+  internal levels once PER ENTRY, and the internal levels are the part this
+  design rebuilds in full — so a thousand entries would rewrite them a
+  thousand times and cost more than the rebuild the whole exercise exists to
+  avoid. Here every affected leaf is rebuilt, then the internal levels are
+  re-chunked exactly once.
+
+  A fold's novelty is precisely this shape: many entries at once, spread over
+  a few leaves. `pairs` need not be sorted or distinct; later pairs win for a
+  repeated key, matching `insert`'s replace semantics.
+
+  Byte-identical to `(build-tree put! all-sorted-entries)`, same as `insert`,
+  and the tests assert it against both a rebuild and a loop of single inserts."
+  [put! get-fn root-cid pairs]
+  (let [pairs (vec pairs)]
+    (cond
+      (empty? pairs) root-cid
+      (nil? root-cid) (build-tree put! (->> pairs
+                                            (reduce (fn [m [k v]] (assoc m k v)) {})
+                                            (sort-by first)
+                                            vec))
+      :else
+      (let [leaves (leaf-summaries get-fn root-cid)
+            ;; group by the leaf that owns each key, so every leaf is read and
+            ;; rebuilt at most once however many keys land in it
+            by-leaf (reduce (fn [acc [k v]]
+                              (update acc (child-index leaves k) (fnil conj []) [k v]))
+                            {}
+                            pairs)
+            level (reduce
+                   (fn [level [i additions]]
+                     ;; `i` indexes the ORIGINAL leaves. Splicing shifts every
+                     ;; position after it, so this runs right-to-left: a splice
+                     ;; at a higher index cannot move a lower one, and `i`
+                     ;; stays valid without tracking an offset.
+                     (let [at i
+                           leaf (get-node get-fn (second (nth level at)))
+                           entries (reduce (fn [es [k v]] (upsert-sorted es k v))
+                                           (node-entries leaf)
+                                           additions)]
+                       (splice level at 1 (rechunk-leaves put! entries))))
+                   leaves
+                   ;; descending so each splice only affects indices after it
+                   (sort-by first > by-leaf))]
+        (loop [level level]
+          (if (= 1 (count level))
+            (second (first level))
+            (recur (rechunk-internal put! level))))))))
