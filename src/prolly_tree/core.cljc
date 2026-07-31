@@ -271,3 +271,127 @@
                                                 (children-to-walk node))
                                     (.then (fn [results] (vec (apply concat results))))))))))]
          (walk root-cid)))))
+
+;; ── Incremental insert ──────────────────────────────────────────────────────
+;;
+;; Why this can exist at all, and why it must be byte-identical to a rebuild.
+;;
+;; Chunk boundaries here are CONTENT-DEFINED and purely local: a leaf chunk ends
+;; after an entry whose KEY hashes to a boundary, an internal chunk ends after a
+;; child whose CID hashes to a boundary. Nothing about a chunk depends on how
+;; many entries precede it or on how the tree was assembled. That is the
+;; property (history independence) the whole content-addressed design rests on:
+;; the same logical content must produce the same CIDs regardless of insertion
+;; order, or two replicas holding identical data disagree about their hashes.
+;;
+;; It also means an insert cannot ripple: adding key K changes exactly the run
+;; of entries between the boundary before K and the boundary at or after it.
+;; Every other chunk's bytes are untouched and are structurally shared.
+;;
+;; So `insert` rebuilds a bounded WINDOW at each level rather than the level:
+;; the affected child plus its immediate successor. The successor is needed
+;; because a replacement changes a child's CID, and a child that WAS a boundary
+;; may stop being one -- in which case its chunk must absorb the next one. That
+;; merge is the case a naive "re-chunk this node's own children" misses, and it
+;; is exactly the case that would silently produce a tree no rebuild could
+;; reproduce.
+;;
+;; `insert-tested-equivalent?` in the tests is the gate: for randomized key
+;; sets and insertion orders, inserting into a tree must yield the SAME root CID
+;; as building the whole sorted set from scratch. An implementation that is
+;; merely "close" is worse than none, because the divergence is invisible until
+;; two nodes compare roots.
+
+(defn- leaf-node? [node] (= "leaf" (get node "kind")))
+
+(defn- node-entries
+  "Leaf entries as a vector of [k v], with dag-cbor's vectors normalized."
+  [node]
+  (mapv vec (get node "entries")))
+
+(defn- node-children
+  "Internal children as a vector of [max-key cid-string]. In-memory summaries
+  stay plain CID strings so boundary math is encoding-independent, matching
+  `build-internal-level`."
+  [node]
+  (mapv (fn [entry] [(first entry) (child-cid entry)]) (get node "children")))
+
+(defn- upsert-sorted
+  "Insert or replace [k v] in a sorted vector of entries, keeping key order."
+  [entries k v]
+  (let [i (count (take-while #(neg? (compare (first %) k)) entries))
+        hit? (and (< i (count entries)) (= k (first (nth entries i))))]
+    (if hit?
+      (assoc entries i [k v])
+      (vec (concat (subvec entries 0 i) [[k v]] (subvec entries i))))))
+
+(defn- child-index
+  "Index of the child that owns `k`: the first whose max-key >= k, else the
+  last. Same rule `lookup` descends by, kept in one place."
+  [children k]
+  (or (first (keep-indexed (fn [i [max-key _]]
+                             (when (<= (compare k max-key) 0) i))
+                           children))
+      (dec (count children))))
+
+(defn- rechunk-leaves
+  "Re-chunk `entries` into leaf nodes and return their [max-key cid] summaries."
+  [put! entries]
+  (build-leaf-level put! entries))
+
+(defn- rechunk-internal
+  "Re-chunk `children` into internal nodes and return their summaries."
+  [put! children]
+  (build-internal-level put! children))
+
+(defn- splice
+  "Replace `n` items of `v` starting at `i` with `replacement`."
+  [v i n replacement]
+  (vec (concat (subvec v 0 i) replacement (subvec v (min (count v) (+ i n))))))
+
+(defn- window-end
+  "How many items starting at `i` the rebuild window must cover.
+
+  Two, when item `i` is not the last and the ORIGINAL item at `i` ended its
+  chunk (was a boundary): the replacement may not be a boundary, so the chunk
+  would extend into the next one and both must be re-chunked together. One
+  otherwise."
+  [items i boundary-fn]
+  (if (and (< (inc i) (count items)) (boundary-fn (nth items i)))
+    2
+    1))
+
+(defn- insert-at
+  "Insert [k v] under the subtree at `cid` and return that subtree's new
+  [max-key cid] summaries -- one entry normally, more when a chunk split."
+  [put! get-fn cid k v]
+  (let [node (get-node get-fn cid)]
+    (if (leaf-node? node)
+      (rechunk-leaves put! (upsert-sorted (node-entries node) k v))
+      (let [children (node-children node)
+            i (child-index children k)
+            ;; summaries of the rebuilt SUBTREE, one level down
+            replaced (insert-at put! get-fn (second (nth children i)) k v)
+            ;; this node's own children with that subtree swapped in, then
+            ;; re-chunked into however many nodes the boundaries call for
+            new-children (splice children i 1 replaced)]
+        (rechunk-internal put! new-children)))))
+
+(defn insert
+  "Insert or replace `[k v]` under `root-cid`, writing only the nodes on the
+  affected path via `(put! cid bytes)`, and return the new root CID.
+
+  A nil `root-cid` builds a single-entry tree. Every untouched chunk is shared
+  with the old tree rather than rewritten, which is the difference between an
+  update costing O(log n) blocks and one costing O(n) -- the reason a fold over
+  a large graph currently cannot fit in a Worker's budget.
+
+  The result is byte-identical to `(build-tree put! sorted-entries-with-k)`;
+  the tests treat any divergence as a failure rather than a variant."
+  [put! get-fn root-cid k v]
+  (if (nil? root-cid)
+    (build-tree put! [[k v]])
+    (loop [level (insert-at put! get-fn root-cid k v)]
+      (if (= 1 (count level))
+        (second (first level))
+        (recur (rechunk-internal put! level))))))
