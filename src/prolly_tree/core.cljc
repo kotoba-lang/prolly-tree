@@ -271,3 +271,133 @@
                                                 (children-to-walk node))
                                     (.then (fn [results] (vec (apply concat results))))))))))]
          (walk root-cid)))))
+
+;; ── Incremental insert ──────────────────────────────────────────────────────
+;;
+;; Why this can exist at all, and why it must be byte-identical to a rebuild.
+;;
+;; Chunk boundaries here are CONTENT-DEFINED and purely local: a leaf chunk ends
+;; after an entry whose KEY hashes to a boundary, an internal chunk ends after a
+;; child whose CID hashes to a boundary. Nothing about a chunk depends on how
+;; many entries precede it or on how the tree was assembled. That is the
+;; property (history independence) the whole content-addressed design rests on:
+;; the same logical content must produce the same CIDs regardless of insertion
+;; order, or two replicas holding identical data disagree about their hashes.
+;;
+;; It also means an insert cannot ripple: adding key K changes exactly the run
+;; of entries between the boundary before K and the boundary at or after it.
+;; Every other chunk's bytes are untouched and are structurally shared.
+;;
+;; So `insert` rebuilds a bounded WINDOW at each level rather than the level:
+;; the affected child plus its immediate successor. The successor is needed
+;; because a replacement changes a child's CID, and a child that WAS a boundary
+;; may stop being one -- in which case its chunk must absorb the next one. That
+;; merge is the case a naive "re-chunk this node's own children" misses, and it
+;; is exactly the case that would silently produce a tree no rebuild could
+;; reproduce.
+;;
+;; `insert-tested-equivalent?` in the tests is the gate: for randomized key
+;; sets and insertion orders, inserting into a tree must yield the SAME root CID
+;; as building the whole sorted set from scratch. An implementation that is
+;; merely "close" is worse than none, because the divergence is invisible until
+;; two nodes compare roots.
+
+(defn- leaf-node? [node] (= "leaf" (get node "kind")))
+
+(defn- node-entries
+  "Leaf entries as a vector of [k v], with dag-cbor's vectors normalized."
+  [node]
+  (mapv vec (get node "entries")))
+
+(defn- node-children
+  "Internal children as a vector of [max-key cid-string]. In-memory summaries
+  stay plain CID strings so boundary math is encoding-independent, matching
+  `build-internal-level`."
+  [node]
+  (mapv (fn [entry] [(first entry) (child-cid entry)]) (get node "children")))
+
+(defn- upsert-sorted
+  "Insert or replace [k v] in a sorted vector of entries, keeping key order."
+  [entries k v]
+  (let [i (count (take-while #(neg? (compare (first %) k)) entries))
+        hit? (and (< i (count entries)) (= k (first (nth entries i))))]
+    (if hit?
+      (assoc entries i [k v])
+      (vec (concat (subvec entries 0 i) [[k v]] (subvec entries i))))))
+
+(defn- child-index
+  "Index of the child that owns `k`: the first whose max-key >= k, else the
+  last. Same rule `lookup` descends by, kept in one place."
+  [children k]
+  (or (first (keep-indexed (fn [i [max-key _]]
+                             (when (<= (compare k max-key) 0) i))
+                           children))
+      (dec (count children))))
+
+(defn- rechunk-leaves
+  "Re-chunk `entries` into leaf nodes and return their [max-key cid] summaries."
+  [put! entries]
+  (build-leaf-level put! entries))
+
+(defn- rechunk-internal
+  "Re-chunk `children` into internal nodes and return their summaries."
+  [put! children]
+  (build-internal-level put! children))
+
+(defn- splice
+  "Replace `n` items of `v` starting at `i` with `replacement`."
+  [v i n replacement]
+  (vec (concat (subvec v 0 i) replacement (subvec v (min (count v) (+ i n))))))
+
+(defn- leaf-summaries
+  "Every leaf's `[max-key cid]` under `root-cid`, in key order.
+
+  Walks internal nodes only. There are ~1/256 as many of those as there are
+  leaves (and ~1/65536 as many again above them), so collecting the whole leaf
+  index costs O(n/256) reads -- for a five-million-entry tree, on the order of
+  eighty blocks rather than twenty thousand."
+  [get-fn root-cid]
+  (let [node (get-node get-fn root-cid)]
+    (if (leaf-node? node)
+      [[(first (last (node-entries node))) root-cid]]
+      (into [] (mapcat (fn [[_ cid]]
+                         (let [child (get-node get-fn cid)]
+                           (if (leaf-node? child)
+                             [[(first (last (node-entries child))) cid]]
+                             (leaf-summaries get-fn cid)))))
+            (node-children node)))))
+
+(defn insert
+  "Insert or replace `[k v]` under `root-cid`, writing only the affected leaf
+  and the internal nodes above it, and return the new root CID.
+
+  A nil `root-cid` builds a single-entry tree. The result is byte-identical to
+  `(build-tree put! sorted-entries-with-k)` -- the tests treat any divergence
+  as a failure rather than a variant, because a content-addressed store whose
+  insert can produce a tree a rebuild would not is one where two replicas
+  holding identical data disagree about their root hash.
+
+  Only ONE leaf is read and rewritten; every other leaf is shared with the old
+  tree. The internal levels are re-chunked in full rather than patched through
+  a window. That is deliberate: boundaries are content-defined, so a
+  replacement whose new CID stops being a boundary must merge its chunk with
+  the following one, and when the affected node is the last child of its
+  parent that sibling lives under a different parent. A window that cannot see
+  past its parent cannot express that merge, and an earlier draft of this
+  function got it wrong in exactly that case. Re-chunking each internal level
+  from the whole ordered summary list is equivalent to what `build-tree` does
+  by construction, and internal nodes are ~1/256 of the tree -- so the cost is
+  a few dozen blocks where a full rebuild pays tens of thousands, and the
+  correctness argument is one sentence instead of a case analysis."
+  [put! get-fn root-cid k v]
+  (if (nil? root-cid)
+    (build-tree put! [[k v]])
+    (let [leaves (leaf-summaries get-fn root-cid)
+          i (child-index leaves k)
+          leaf (get-node get-fn (second (nth leaves i)))
+          rebuilt (rechunk-leaves put! (upsert-sorted (node-entries leaf) k v))
+          level (splice leaves i 1 rebuilt)]
+      (loop [level level]
+        (if (= 1 (count level))
+          (second (first level))
+          (recur (rechunk-internal put! level)))))))
