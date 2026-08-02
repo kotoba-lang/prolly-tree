@@ -8,7 +8,8 @@
   layer -- CAS, dedup, replication -- is quietly wrong. So the property is
   asserted directly, over randomized key sets and insertion orders, rather than
   spot-checked on a hand-picked example."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
             [prolly-tree.core :as pt]))
 
 (defn- store []
@@ -164,3 +165,76 @@
                          (- (count @blocks) before))]
       (is (< batch-blocks loop-blocks)
           (str "batch wrote " batch-blocks " blocks, loop wrote " loop-blocks)))))
+
+;; ── the async write path ────────────────────────────────────────────────────
+;;
+;; `insert-many-async` is the synchronous function with the I/O peeled off both
+;; ends, so the interesting assertions are the two things that could still
+;; differ: does it produce the same tree, and does it actually wait for the
+;; writes it made.
+
+#?(:cljs
+   (defn- async-store
+     "A store whose reads and writes land SEVERAL TURNS LATER.
+
+     One turn is not enough to test anything: a single `.then` still resolves
+     before the caller's next read even when its promise is dropped, so a
+     one-turn store cannot tell an awaited write from an ignored one --
+     measured on `kotobase-storage`'s signed head, where removing the await
+     left the suite green. Eight turns can, and a network round trip is many
+     more than eight."
+     []
+     (let [blocks (atom {})
+           later (fn [f]
+                   (-> (reduce (fn [p _] (.then p identity))
+                               (js/Promise.resolve nil)
+                               (range 8))
+                       (.then (fn [_] (f)))))]
+       {:put! (fn [cid bytes] (later #(do (swap! blocks assoc cid bytes) cid)))
+        :get-fn (fn [cid] (later #(get @blocks cid)))
+        :blocks blocks})))
+
+#?(:cljs
+   (deftest async-insert-many-matches-the-synchronous-tree
+     (testing "same input, same root -- history independence does not get a
+               different answer because the store is remote"
+       (async done
+         (let [sync-s (store)
+               entries (mapv (fn [i] [(key-str i) i]) (range 400))
+               base (pt/build-tree (:put! sync-s) (sort-by first entries))
+               additions (mapv (fn [i] [(key-str i) i]) (range 400 460))
+               expected (pt/insert-many (:put! sync-s) (:get-fn sync-s) base additions)
+               async-s (async-store)]
+           ;; seed the async store with the same base tree
+           (reset! (:blocks async-s) @(:blocks sync-s))
+           (-> (pt/insert-many-async (:put! async-s) (:get-fn async-s) base additions)
+               (.then (fn [root]
+                        (is (= expected root)
+                            "async root is byte-identical to the sync root")
+                        (done)))
+               (.catch (fn [e] (is false (str "threw: " e)) (done)))))))))
+
+#?(:cljs
+   (deftest async-insert-many-awaits-its-writes
+     (testing "the reason this exists: the caller gets a root only once the
+               blocks that root names have actually landed"
+       (async done
+         (let [{:keys [put! get-fn blocks]} (async-store)
+               entries (mapv (fn [i] [(key-str i) i]) (range 300))]
+           (-> (pt/insert-many-async put! get-fn nil entries)
+               (.then (fn [root]
+                        ;; Checked the instant the promise resolves, with no
+                        ;; further turns. If the writes were fired and not
+                        ;; awaited, this root names bytes that are still in
+                        ;; flight -- which is exactly how a published head ends
+                        ;; up pointing at blocks a reader cannot fetch.
+                        (is (some? (get @blocks root))
+                            "the root's own block is in the store")
+                        (is (= (count entries)
+                               (count (filter some?
+                                              (map #(pt/lookup (fn [c] (get @blocks c))
+                                                               root (first %))
+                                                   entries))))
+                            "and every entry is readable from it")
+                        (done)))
+               (.catch (fn [e] (is false (str "threw: " e)) (done)))))))))

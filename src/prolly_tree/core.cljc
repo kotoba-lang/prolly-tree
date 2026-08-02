@@ -454,3 +454,89 @@
           (if (= 1 (count level))
             (second (first level))
             (recur (rechunk-internal put! level))))))))
+
+;; ── the write path, for a store that answers with a Promise ─────────────────
+;;
+;; `scan-prefix` grew an async counterpart and the write path never did, so a
+;; caller on a Promise-returning store could read a tree it had no way to
+;; update. Two consumers hit that asymmetry from opposite sides this week:
+;; `arrangement`'s `commit-delta!` had a `:cljs` branch that `.then`ed the
+;; synchronous `insert-many` (so it could not complete at all), and
+;; `kotobase-storage`'s signed head needed the same treatment one layer up.
+;;
+;; This is deliberately NOT an async re-implementation of the algorithm. The
+;; insert logic is subtle -- the internal levels are re-chunked in full for a
+;; correctness reason `insert`'s docstring spends a paragraph on, and an
+;; earlier draft got exactly that case wrong. A parallel async copy would be
+;; two places to get it right and one place to forget. Instead the I/O is
+;; peeled off both ends: fetch what the traversal will read, run the existing
+;; synchronous function against that, then flush the writes it buffered.
+;;
+;; What this buys, precisely: the writes are AWAITED before the new root CID
+;; is handed back. `insert-many` calls `put!` and ignores what it returns, so
+;; a Promise-returning `put!` was never waited on -- the caller got a root
+;; naming blocks that might not have landed yet, and would publish a head
+;; pointing at them.
+
+#?(:cljs
+   (defn- warm!
+     "Fetch every node the traversal will read under `cid` into `cache`,
+     concurrently and in bounded batches.
+
+     Reads exactly what `leaf-summaries` reads -- every child of every
+     internal node, leaves included, because that walk fetches each child to
+     decide whether it is one. Matching it exactly is the point: the sync
+     function then runs entirely on cache hits."
+     [get-fn cache cid]
+     (if (contains? @cache cid)
+       (js/Promise.resolve nil)
+       (-> (js/Promise.resolve (get-fn cid))
+           (.then (fn [bytes]
+                    (swap! cache assoc cid bytes)
+                    ;; `verified-node`, not `ipld/decode` -- the CID check
+                    ;; belongs on this path too, and skipping it here would
+                    ;; make the async reader the trusting one.
+                    (let [node (verified-node cid bytes)]
+                      (if (leaf-node? node)
+                        nil
+                        ;; `node-children` has ALREADY resolved the tag-42
+                        ;; links -- it returns [max-key cid-string], which is
+                        ;; why `leaf-summaries` destructures `[_ cid]`.
+                        ;; Applying `child-cid` again here yields nil.
+                        (pmap-async #(warm! get-fn cache (second %))
+                                    (node-children node))))))))))
+
+#?(:cljs
+   (defn insert-many-async
+     "`insert-many` for a `get-fn`/`put!` pair that returns Promises.
+
+     -> `js/Promise` of the new root CID, resolved only after every block it
+     wrote has been acknowledged. Byte-identical to the synchronous result for
+     the same input, because it IS the synchronous function -- see the note
+     above."
+     [put! get-fn root-cid pairs]
+     (let [pairs (vec pairs)]
+       (if (empty? pairs)
+         (js/Promise.resolve root-cid)
+         (let [cache (atom {})
+               writes (atom [])
+               ;; `put-node!` uses the return value, so keep `insert-many`'s
+               ;; contract: hand back the cid, buffer the bytes.
+               buffered-put! (fn [cid bytes] (swap! writes conj [cid bytes]) cid)]
+           (-> (if (nil? root-cid)
+                 (js/Promise.resolve nil)
+                 (warm! get-fn cache root-cid))
+               (.then (fn [_]
+                        (insert-many buffered-put! #(get @cache %) root-cid pairs)))
+               (.then (fn [new-root]
+                        (-> (pmap-async (fn [[cid bytes]]
+                                          (js/Promise.resolve (put! cid bytes)))
+                                        @writes)
+                            (.then (fn [_] new-root)))))))))))
+
+#?(:cljs
+   (defn insert-async
+     "`insert` for a Promise-returning store. One pair through
+     `insert-many-async`, which has identical replace semantics."
+     [put! get-fn root-cid k v]
+     (insert-many-async put! get-fn root-cid [[k v]])))
