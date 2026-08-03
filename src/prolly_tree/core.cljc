@@ -349,6 +349,31 @@
   [v i n replacement]
   (vec (concat (subvec v 0 i) replacement (subvec v (min (count v) (+ i n))))))
 
+(defn- tree-height
+  "Number of internal levels below `root-cid`. A leaf root has height zero.
+  Prolly trees are level-balanced, so following the first child is sufficient."
+  [get-fn root-cid]
+  (loop [cid root-cid, height 0]
+    (let [node (get-node get-fn cid)]
+      (if (leaf-node? node)
+        height
+        (recur (second (first (node-children node))) (inc height))))))
+
+(defn- leaf-summaries-at-height
+  [get-fn cid height]
+  (let [node (get-node get-fn cid)]
+    (cond
+      (zero? height)
+      [[(first (last (node-entries node))) cid]]
+
+      (= 1 height)
+      (node-children node)
+
+      :else
+      (into [] (mapcat (fn [[_ child]]
+                         (leaf-summaries-at-height get-fn child (dec height))))
+            (node-children node)))))
+
 (defn- leaf-summaries
   "Every leaf's `[max-key cid]` under `root-cid`, in key order.
 
@@ -357,15 +382,30 @@
   index costs O(n/256) reads -- for a five-million-entry tree, on the order of
   eighty blocks rather than twenty thousand."
   [get-fn root-cid]
-  (let [node (get-node get-fn root-cid)]
-    (if (leaf-node? node)
-      [[(first (last (node-entries node))) root-cid]]
-      (into [] (mapcat (fn [[_ cid]]
-                         (let [child (get-node get-fn cid)]
-                           (if (leaf-node? child)
-                             [[(first (last (node-entries child))) cid]]
-                             (leaf-summaries get-fn cid)))))
-            (node-children node)))))
+  (leaf-summaries-at-height get-fn root-cid
+                            (tree-height get-fn root-cid)))
+
+(defn- mutation-plan
+  [leaves additions removals]
+  (let [last-index (dec (count leaves))
+        addition-indexed (mapv (fn [[k _ :as pair]]
+                                 [(child-index leaves k) pair])
+                               additions)
+        removal-indices (map #(child-index leaves %) removals)
+        affected (-> (set (map first addition-indexed))
+                     (into (mapcat #(if (< % last-index) [% (inc %)] [%])
+                                   removal-indices))
+                     sort)
+        windows (reduce (fn [ranges i]
+                          (if (and (seq ranges)
+                                   (= i (inc (second (peek ranges)))))
+                            (conj (pop ranges) [(first (peek ranges)) i])
+                            (conj ranges [i i])))
+                        []
+                        affected)]
+    {:addition-indexed addition-indexed
+     :windows windows
+     :removal-set (set removals)}))
 
 (defn insert
   "Insert or replace `[k v]` under `root-cid`, writing only the affected leaf
@@ -470,23 +510,8 @@
       (and (empty? additions) (empty? removals)) root-cid
       :else
       (let [leaves (leaf-summaries get-fn root-cid)
-            last-index (dec (count leaves))
-            addition-indexed (mapv (fn [[k _ :as pair]]
-                                     [(child-index leaves k) pair])
-                                   additions)
-            removal-indices (map #(child-index leaves %) removals)
-            affected (-> (set (map first addition-indexed))
-                         (into (mapcat #(if (< % last-index) [% (inc %)] [%])
-                                       removal-indices))
-                         sort)
-            windows (reduce (fn [ranges i]
-                              (if (and (seq ranges)
-                                       (= i (inc (second (peek ranges)))))
-                                (conj (pop ranges) [(first (peek ranges)) i])
-                                (conj ranges [i i])))
-                            []
-                            affected)
-            removal-set (set removals)
+            {:keys [addition-indexed windows removal-set]}
+            (mutation-plan leaves additions removals)
             level (reduce
                    (fn [level [start end]]
                      (let [retained (->> (subvec level start (inc end))
@@ -548,32 +573,70 @@
 ;; pointing at them.
 
 #?(:cljs
-   (defn- warm!
-     "Fetch every node the traversal will read under `cid` into `cache`,
-     concurrently and in bounded batches.
-
-     Reads exactly what `leaf-summaries` reads -- every child of every
-     internal node, leaves included, because that walk fetches each child to
-     decide whether it is one. Matching it exactly is the point: the sync
-     function then runs entirely on cache hits."
+   (defn- fetch-node!
      [get-fn cache cid]
      (if (contains? @cache cid)
-       (js/Promise.resolve nil)
+       (js/Promise.resolve (verified-node cid (get @cache cid)))
        (-> (js/Promise.resolve (get-fn cid))
            (.then (fn [bytes]
                     (swap! cache assoc cid bytes)
-                    ;; `verified-node`, not `ipld/decode` -- the CID check
-                    ;; belongs on this path too, and skipping it here would
-                    ;; make the async reader the trusting one.
-                    (let [node (verified-node cid bytes)]
-                      (if (leaf-node? node)
-                        nil
-                        ;; `node-children` has ALREADY resolved the tag-42
-                        ;; links -- it returns [max-key cid-string], which is
-                        ;; why `leaf-summaries` destructures `[_ cid]`.
-                        ;; Applying `child-cid` again here yields nil.
-                        (pmap-async #(warm! get-fn cache (second %))
-                                    (node-children node))))))))))
+                    (verified-node cid bytes)))))))
+
+#?(:cljs
+   (defn- warm-height!
+     [get-fn cache root-cid]
+     (letfn [(walk [cid height]
+               (-> (fetch-node! get-fn cache cid)
+                   (.then (fn [node]
+                            (if (leaf-node? node)
+                              height
+                              (walk (second (first (node-children node)))
+                                    (inc height)))))))]
+       (walk root-cid 0))))
+
+#?(:cljs
+   (defn- warm-leaf-summaries!
+     [get-fn cache cid height]
+     (-> (fetch-node! get-fn cache cid)
+         (.then
+          (fn [node]
+            (cond
+              (zero? height)
+              [[(first (last (node-entries node))) cid]]
+
+              (= 1 height)
+              (node-children node)
+
+              :else
+              (-> (pmap-async
+                   (fn [[_ child]]
+                     (warm-leaf-summaries! get-fn cache child (dec height)))
+                   (node-children node))
+                  (.then (fn [levels] (vec (apply concat levels)))))))))))
+
+#?(:cljs
+   (defn- warm-mutation!
+     "Warm internal summary blocks plus only the leaf windows a mutation reads.
+
+     The old writer recursively fetched every leaf merely to discover that it
+     was a leaf. Height makes that discovery once; a penultimate internal node
+     already contains every child's max-key/CID summary."
+     [get-fn cache root-cid additions removals]
+     (-> (warm-height! get-fn cache root-cid)
+         (.then
+          (fn [height]
+            (-> (warm-leaf-summaries! get-fn cache root-cid height)
+                (.then
+                 (fn [leaves]
+                   (let [{:keys [windows]}
+                         (mutation-plan leaves additions removals)
+                         leaf-cids
+                         (distinct
+                          (mapcat
+                           (fn [[start end]]
+                             (map second (subvec leaves start (inc end))))
+                           windows))]
+                     (pmap-async #(fetch-node! get-fn cache %) leaf-cids))))))))))
 
 #?(:cljs
    (defn insert-many-async
@@ -594,7 +657,7 @@
                buffered-put! (fn [cid bytes] (swap! writes conj [cid bytes]) cid)]
            (-> (if (nil? root-cid)
                  (js/Promise.resolve nil)
-                 (warm! get-fn cache root-cid))
+                 (warm-mutation! get-fn cache root-cid pairs []))
                (.then (fn [_]
                         (insert-many buffered-put! #(get @cache %) root-cid pairs)))
                (.then (fn [new-root]
@@ -616,7 +679,7 @@
                writes (atom [])
                buffered-put! (fn [cid bytes] (swap! writes conj [cid bytes]) cid)]
            (-> (if root-cid
-                 (warm! get-fn cache root-cid)
+                 (warm-mutation! get-fn cache root-cid additions removals)
                  (js/Promise.resolve nil))
                (.then (fn [_]
                         (mutate-many buffered-put! #(get @cache %) root-cid
