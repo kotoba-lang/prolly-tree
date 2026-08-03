@@ -455,6 +455,75 @@
             (second (first level))
             (recur (rechunk-internal put! level))))))))
 
+(defn mutate-many
+  "Apply `additions` (`[k v]`) and `removals` (keys) in one leaf pass.
+
+  Removal windows include the successor leaf because deleting a boundary key
+  can merge its chunk with the following chunk. Additions and removals sharing
+  a window are coalesced, and internal levels are rebuilt exactly once.
+  Additions win when the same key occurs in both inputs."
+  [put! get-fn root-cid additions removals]
+  (let [additions (vec additions)
+        removals (vec (distinct removals))]
+    (cond
+      (nil? root-cid) (insert-many put! get-fn nil additions)
+      (and (empty? additions) (empty? removals)) root-cid
+      :else
+      (let [leaves (leaf-summaries get-fn root-cid)
+            last-index (dec (count leaves))
+            addition-indexed (mapv (fn [[k _ :as pair]]
+                                     [(child-index leaves k) pair])
+                                   additions)
+            removal-indices (map #(child-index leaves %) removals)
+            affected (-> (set (map first addition-indexed))
+                         (into (mapcat #(if (< % last-index) [% (inc %)] [%])
+                                       removal-indices))
+                         sort)
+            windows (reduce (fn [ranges i]
+                              (if (and (seq ranges)
+                                       (= i (inc (second (peek ranges)))))
+                                (conj (pop ranges) [(first (peek ranges)) i])
+                                (conj ranges [i i])))
+                            []
+                            affected)
+            removal-set (set removals)
+            level (reduce
+                   (fn [level [start end]]
+                     (let [retained (->> (subvec level start (inc end))
+                                         (mapcat (fn [[_ cid]]
+                                                   (node-entries
+                                                    (get-node get-fn cid))))
+                                         (remove (fn [[k _]]
+                                                   (contains? removal-set k)))
+                                         vec)
+                           window-additions (keep (fn [[i pair]]
+                                                    (when (<= start i end) pair))
+                                                  addition-indexed)
+                           entries (reduce (fn [es [k v]]
+                                             (upsert-sorted es k v))
+                                           retained
+                                           window-additions)]
+                       (splice level start (inc (- end start))
+                               (rechunk-leaves put! entries))))
+                   leaves
+                   (sort-by first > windows))]
+        (loop [level level]
+          (cond
+            (empty? level) nil
+            (= 1 (count level)) (second (first level))
+            :else (recur (rechunk-internal put! level))))))))
+
+(defn delete-many
+  "Delete `keys` under `root-cid` in one pass and return the new root CID.
+  Missing and duplicate keys are no-ops; deleting the last entry returns nil."
+  [put! get-fn root-cid keys]
+  (mutate-many put! get-fn root-cid [] keys))
+
+(defn delete
+  "Delete `k` under `root-cid`; one-key convenience over `delete-many`."
+  [put! get-fn root-cid k]
+  (delete-many put! get-fn root-cid [k]))
+
 ;; ── the write path, for a store that answers with a Promise ─────────────────
 ;;
 ;; `scan-prefix` grew an async counterpart and the write path never did, so a
@@ -533,6 +602,42 @@
                                           (js/Promise.resolve (put! cid bytes)))
                                         @writes)
                             (.then (fn [_] new-root)))))))))))
+
+#?(:cljs
+   (defn mutate-many-async
+     "`mutate-many` for a Promise-returning store. Resolves only after every
+     newly referenced block has been acknowledged."
+     [put! get-fn root-cid additions removals]
+     (let [additions (vec additions)
+           removals (vec (distinct removals))]
+       (if (and (empty? additions) (empty? removals))
+         (js/Promise.resolve root-cid)
+         (let [cache (atom {})
+               writes (atom [])
+               buffered-put! (fn [cid bytes] (swap! writes conj [cid bytes]) cid)]
+           (-> (if root-cid
+                 (warm! get-fn cache root-cid)
+                 (js/Promise.resolve nil))
+               (.then (fn [_]
+                        (mutate-many buffered-put! #(get @cache %) root-cid
+                                     additions removals)))
+               (.then (fn [new-root]
+                        (-> (pmap-async (fn [[cid bytes]]
+                                          (js/Promise.resolve (put! cid bytes)))
+                                        @writes)
+                            (.then (fn [_] new-root)))))))))))
+
+#?(:cljs
+   (defn delete-many-async
+     "`delete-many` for a Promise-returning store."
+     [put! get-fn root-cid keys]
+     (mutate-many-async put! get-fn root-cid [] keys)))
+
+#?(:cljs
+   (defn delete-async
+     "`delete` for a Promise-returning store."
+     [put! get-fn root-cid k]
+     (delete-many-async put! get-fn root-cid [k])))
 
 #?(:cljs
    (defn insert-async
