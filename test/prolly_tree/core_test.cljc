@@ -2,6 +2,7 @@
   (:require #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
             [prolly-tree.core :as pt]
+            [clojure.string :as str]
             [ipld.core :as ipld]))
 
 (defn- mem-store []
@@ -85,7 +86,7 @@
     (testing "correctness: prefix returns exactly its 1000 matches"
       (let [rows (pt/scan-prefix get-fn root "mmm/")]
         (is (= 1000 (count rows)))
-        (is (every? (fn [[k _]] (clojure.string/starts-with? k "mmm/")) rows))))
+        (is (every? (fn [[k _]] (str/starts-with? k "mmm/")) rows))))
     (testing "pruning fetches fewer blocks than a full scan"
       (let [pruned @gets]
         (reset! gets 0)
@@ -97,6 +98,74 @@
       (reset! gets 0)
       (is (= [] (pt/scan-prefix get-fn root "nope/")))
       (is (< @gets total-blocks) "absent-prefix scan is pruned, not a full walk"))))
+
+(deftest delete-many-is-history-independent
+  (let [entries (mapv (fn [i] [(key-str i) i]) (range 2000))
+        removed (set (concat (range 0 17) (range 911 938) (range 1980 2000)))
+        remaining (filterv (fn [[_ v]] (not (contains? removed v))) entries)
+        incremental (mem-store)
+        rebuilt (mem-store)
+        root (pt/build-tree (:put! incremental) entries)
+        deleted (pt/delete-many (:put! incremental) (:get-fn incremental)
+                                root (map key-str removed))
+        expected (pt/build-tree (:put! rebuilt) remaining)]
+    (is (= expected deleted) "delete history must not affect the root CID")
+    (doseq [i removed]
+      (is (nil? (pt/lookup (:get-fn incremental) deleted (key-str i)))))
+    (is (= 500 (pt/lookup (:get-fn incremental) deleted (key-str 500))))))
+
+(deftest delete-many-handles-noops-and-empty-result
+  (let [{:keys [put! get-fn]} (mem-store)
+        root (pt/build-tree put! [["a" 1] ["b" 2]])]
+    (is (= root (pt/delete-many put! get-fn root [])))
+    (is (= root (pt/delete-many put! get-fn root ["missing" "missing"])))
+    (is (nil? (pt/delete-many put! get-fn root ["a" "b"])))
+    (is (nil? (pt/delete-many put! get-fn nil ["a"])))))
+
+(deftest delete-many-writes-less-than-a-full-rebuild
+  (let [{:keys [put! get-fn store]} (mem-store)
+        entries (mapv (fn [i] [(key-str i) i]) (range 3000))
+        root (pt/build-tree put! entries)
+        before (count @store)
+        _ (pt/delete-many put! get-fn root (map key-str (range 1400 1420)))
+        delta-writes (- (count @store) before)
+        full (mem-store)
+        remaining (filterv (fn [[_ v]] (not (<= 1400 v 1419))) entries)
+        _ (pt/build-tree (:put! full) remaining)
+        full-writes (count @(:store full))]
+    (is (< delta-writes (/ full-writes 2))
+        (str "delete wrote " delta-writes " new blocks; rebuild wrote "
+             full-writes))))
+
+(deftest delete-then-insert-is-history-independent
+  (let [entries (->> (range 2000)
+                     (map (fn [i] [(pr-str [(str "s" i) "p" (str "o" i)]) i]))
+                     (sort-by first)
+                     vec)
+        removals (mapv (fn [i] (pr-str [(str "s" i) "p" (str "o" i)]))
+                       (range 900 920))
+        additions (mapv (fn [i]
+                          [(pr-str [(str "s" i) "p" (str "o" i)]) i])
+                        (range 2000 2020))
+        incremental (mem-store)
+        root (pt/build-tree (:put! incremental) entries)
+        deleted (pt/delete-many (:put! incremental) (:get-fn incremental)
+                                root removals)
+        actual (pt/insert-many (:put! incremental) (:get-fn incremental)
+                               deleted additions)
+        removal-set (set removals)
+        rebuilt (mem-store)
+        deleted-expected (pt/build-tree
+                          (:put! rebuilt)
+                          (sort-by first
+                                   (remove #(contains? removal-set (first %)) entries)))
+        expected (pt/build-tree
+                  (:put! rebuilt)
+                  (sort-by first
+                           (concat (remove #(contains? removal-set (first %)) entries)
+                                   additions)))]
+    (is (= deleted-expected deleted) "delete alone must match a rebuild")
+    (is (= expected actual))))
 
 #?(:cljs
    (defn- async-mem-store []
@@ -161,4 +230,25 @@
              (.then (fn [_] (is false "wrong-CID bytes must reject") (done)))
              (.catch (fn [e]
                        (is (= :ipld/cid-mismatch (:type (ex-data e))))
+                       (done))))))))
+
+#?(:cljs
+   (deftest delete-many-async-matches-rebuild
+     (async done
+       (let [{:keys [put! store]} (async-mem-store)
+             entries (mapv (fn [i] [(key-str i) i]) (range 600))
+             root (pt/build-tree put! entries)
+             rebuilt (mem-store)
+             expected (pt/build-tree (:put! rebuilt)
+                                     (filterv (fn [[_ v]] (not (<= 200 v 229)))
+                                              entries))]
+         (-> (pt/delete-many-async
+              (fn [cid bytes]
+                (js/Promise.resolve (do (swap! store assoc cid bytes) cid)))
+              (fn [cid] (js/Promise.resolve (get @store cid)))
+              root (map key-str (range 200 230)))
+             (.then (fn [deleted]
+                      (is (= expected deleted))
+                      (done)))
+             (.catch (fn [e] (is false (str "delete-many-async threw: " e))
                        (done))))))))
