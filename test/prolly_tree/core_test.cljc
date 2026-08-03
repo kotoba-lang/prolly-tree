@@ -252,3 +252,35 @@
                       (done)))
              (.catch (fn [e] (is false (str "delete-many-async threw: " e))
                        (done))))))))
+
+#?(:cljs
+   (deftest async-mutation-does-not-prefetch-every-leaf
+     (async done
+       (let [base-store (mem-store)
+             entries (mapv (fn [i] [(key-str i) i]) (range 8000))
+             base-root (pt/build-tree (:put! base-store) entries)
+             total-blocks (count @(:store base-store))
+             expected-store (mem-store)
+             expected (pt/build-tree
+                       (:put! expected-store)
+                       (conj (filterv (fn [[_ v]] (not= 4000 v)) entries)
+                             [(key-str 8000) 8000]))
+             {:keys [put! get-fn gets store]} (async-mem-store)]
+         (reset! store @(:store base-store))
+         (reset! gets 0)
+         (-> (pt/mutate-many-async put! get-fn base-root
+                                   [[(key-str 8000) 8000]]
+                                   [(key-str 4000)])
+             (.then
+              (fn [root]
+                (is (= expected root) "cold mutation remains CID-identical")
+                (is (> total-blocks 20))
+                (println "  [cold mutation]" @gets "GETs over"
+                         total-blocks "stored blocks")
+                (is (< @gets (/ total-blocks 3))
+                    (str "cold mutation fetched " @gets " of "
+                         total-blocks " blocks; leaf prefetch regressed"))
+                (done)))
+             (.catch (fn [e]
+                       (is false (str "cold mutation threw: " e))
+                       (done))))))))
