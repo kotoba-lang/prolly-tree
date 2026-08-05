@@ -131,6 +131,23 @@
   [[_ link]]
   (ipld/link-cid link))
 
+(defn- descend-cid
+  "The child CID that owns `k`, given a decoded internal node's `children`:
+  the first whose max-key >= k, else the last.
+
+  Kept in one place because `lookup`, `inclusion-proof` and `verify` must
+  descend identically. A verifier that follows a different rule from the
+  prover accepts proofs for the wrong leaf -- and `child-index` above already
+  states this same rule for the `[max-key cid-string]` summary shape, so
+  there were two statements of it before this one and now there are two
+  again, one per shape, rather than four."
+  [children k]
+  (or (some (fn [entry]
+              (when (<= (compare k (first entry)) 0)
+                (child-cid entry)))
+            children)
+      (child-cid (last children))))
+
 (defn lookup
   "Point lookup of `k` under `root-cid`, fetching nodes via `(get-fn cid) ->
   bytes`. Returns the value, or nil if `k` is absent or `root-cid` is nil
@@ -141,14 +158,7 @@
       (let [node (get-node get-fn cid)]
         (case (get node "kind")
           "leaf" (some (fn [[ek ev]] (when (= ek k) ev)) (get node "entries"))
-          "internal"
-          (let [children (get node "children")
-                target (or (some (fn [entry]
-                                   (when (<= (compare k (first entry)) 0)
-                                     (child-cid entry)))
-                                 children)
-                           (child-cid (last children)))]
-            (recur target)))))))
+          "internal" (recur (descend-cid (get node "children") k)))))))
 
 (defn scan-prefix
   "All `[k v]` pairs whose string key starts with `prefix`, fetching nodes via
@@ -271,6 +281,92 @@
                                                 (children-to-walk node))
                                     (.then (fn [results] (vec (apply concat results))))))))))]
          (walk root-cid)))))
+
+;; ── Inclusion proof ─────────────────────────────────────────────────────────
+;;
+;; What a proof for this tree can be, and what it cannot.
+;;
+;; In a binary Merkle tree a proof is a sibling path: O(log n) hashes, and the
+;; verifier recomputes the root by hashing pairs upward. That shape is not
+;; available here, and the reason is structural rather than an omission. A
+;; node's CID is the CID of the DAG-CBOR encoding of the WHOLE node, and an
+;; internal node carries every child's link. To recompute a parent's CID you
+;; therefore need the parent's entire child list, not one sibling hash.
+;;
+;; So a proof is the list of BLOCKS along the root->leaf path, and the verifier
+;; re-derives each block's CID and checks that the descent for `k` selects the
+;; next block in the list. This is the same shape Ethereum's MPT proofs take
+;; -- the encoded nodes along the path, not sibling hashes -- and for the same
+;; reason.
+;;
+;; The cost is worth stating rather than discovering: a proof carries O(height)
+;; blocks and a block holds a whole chunk (~256 entries at the default
+;; boundary), so a proof is kilobytes where a binary sibling path would be
+;; hundreds of bytes. A commitment built FOR proving (one value per leaf) is
+;; the right structure when proof size is the binding constraint; this one is
+;; the database's own index, and proving against it is the thing that costs.
+;;
+;; NOT offered: absence proofs. Descending with an absent `k` does land in the
+;; leaf that would hold it, but that argument is sound only if the tree is
+;; well-formed -- keys sorted, every max-key actually maximal -- and a single
+;; root->leaf path cannot establish well-formedness. Inclusion needs no such
+;; assumption, because the verifier SEES the pair in a block it hashed itself.
+
+(defn inclusion-proof
+  "The blocks along the path from `root-cid` to the leaf holding `k`, root
+  first, leaf last. Fetches via `(get-fn cid) -> bytes`.
+
+  Returns nil when `k` is absent or `root-cid` is nil. A nil return does NOT
+  prove absence (see the note above); it means there is no inclusion proof to
+  hand out.
+
+  The proof is EXACTLY the path -- no envelope carrying the root or the key --
+  because `verify` must take both of those from its own caller. A verifier
+  that reads the root it checks against out of the thing being checked
+  verifies nothing."
+  [get-fn root-cid k]
+  (when root-cid
+    (loop [cid root-cid, path []]
+      (let [bytes (get-fn cid)
+            node (verified-node cid bytes)
+            path' (conj path bytes)]
+        (case (get node "kind")
+          "leaf" (when (some (fn [entry] (= (first entry) k))
+                             (get node "entries"))
+                   path')
+          "internal" (recur (descend-cid (get node "children") k) path'))))))
+
+(defn verify
+  "Check that `proof` proves `k` is present under `root-cid`, and return
+  `{:value v}` -- or nil if it proves nothing.
+
+  `root-cid` and `k` come from the CALLER. Neither is read out of `proof`.
+
+  The value is wrapped in a map because a stored value may legitimately be
+  nil, and a bare nil return would make `absent` and `present, with value nil`
+  indistinguishable -- exactly the confusion a verifier must not have.
+
+  Every one of these is a failure, and each has a test: a block whose bytes do
+  not hash to the CID the previous step demanded; an internal node whose
+  descent for `k` does not select the next block; a leaf reached before the
+  path ends, or a path that ends without reaching a leaf; a leaf that does not
+  contain `k`. No I/O -- the caller supplies the blocks, which is the point."
+  [root-cid k proof]
+  (when (and root-cid (seq proof))
+    (loop [expected root-cid, blocks (seq proof)]
+      (let [node (try (verified-node expected (first blocks))
+                      (catch #?(:clj Exception :cljs :default) _ nil))
+            more (next blocks)]
+        (when node
+          (case (get node "kind")
+            "leaf" (when (nil? more)
+                     (some (fn [entry]
+                             (when (= (first entry) k)
+                               {:value (second entry)}))
+                           (get node "entries")))
+            "internal" (when (some? more)
+                         (recur (descend-cid (get node "children") k) more))
+            nil))))))
 
 ;; ── Incremental insert ──────────────────────────────────────────────────────
 ;;
