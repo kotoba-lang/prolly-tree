@@ -41,6 +41,38 @@ on the child's CID string), so tree shape is identical.
 (pt/scan-prefix get-fn root "a")              ;=> [["a" 1]]
 ```
 
+## Proving one key to someone who has only the root
+
+```clojure
+(def proof (pt/inclusion-proof get-fn root "b"))  ; the blocks along root->leaf
+(pt/verify root "b" proof)                        ;=> {:value 2}
+(pt/verify root "b" (rest proof))                 ;=> nil
+```
+
+`verify` does no I/O — the caller supplies the blocks. That is the point: a
+party holding only `root` can check the claim without the tree.
+
+**A proof is the path, not a sibling list.** A node's CID is the CID of the
+whole node's DAG-CBOR, and an internal node carries every child's link, so
+recomputing a parent's CID needs the parent's entire child list — not one
+sibling hash. Ethereum's MPT proofs have the same shape for the same reason.
+The cost is worth knowing before you budget for it: a proof carries O(height)
+blocks and a block holds a whole chunk (~256 entries), so it is kilobytes
+where a binary sibling path would be hundreds of bytes. If proof size is the
+binding constraint, commit to a structure built *for* proving; this one is the
+database's own index.
+
+`root-cid` and `k` are arguments to `verify` and are never read out of the
+proof — a verifier that takes the root from the thing it is checking verifies
+nothing.
+
+**Absence is not provable here.** Descending with an absent key does land in
+the leaf that would hold it, but that argument needs the tree to be
+well-formed (keys sorted, every max-key maximal), and one root→leaf path
+cannot establish that. Inclusion needs no such assumption: the verifier sees
+the pair inside a block it hashed itself. `inclusion-proof` returning nil
+means "no proof to hand out", not "absent".
+
 ## Scope
 
 Portability is real now, not aspirational: the whole dependency chain
