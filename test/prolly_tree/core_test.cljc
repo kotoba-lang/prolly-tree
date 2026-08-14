@@ -99,6 +99,42 @@
       (is (= [] (pt/scan-prefix get-fn root "nope/")))
       (is (< @gets total-blocks) "absent-prefix scan is pruned, not a full walk"))))
 
+(deftest scan-range-cuts-the-tree-not-the-result
+  ;; Value-interval analogue of `scan-prefix-prunes-blocks`. A `[lo, hi)`
+  ;; walk must return the same pairs as filtering a full scan, and must
+  ;; fetch fewer blocks than that full scan.
+  (let [store (atom {})
+        gets  (atom 0)
+        put!  (fn [cid bytes] (swap! store assoc cid bytes))
+        get-fn (fn [cid] (swap! gets inc) (get @store cid))
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 3000)))
+        root (pt/build-tree put! entries)
+        total-blocks (count @store)
+        lo (key-str 1000)
+        hi (key-str 1100)
+        want (filterv (fn [[k _]] (and (not (neg? (compare k lo)))
+                                       (neg? (compare k hi))))
+                      entries)]
+    (testing "correctness: [lo, hi) matches a filtered full scan"
+      (is (= want (pt/scan-range get-fn root lo hi))))
+    (testing "hi is exclusive"
+      (is (not (some (fn [[k _]] (= k hi)) (pt/scan-range get-fn root lo hi)))))
+    (testing "pruning fetches fewer blocks than a full walk"
+      (let [pruned @gets]
+        (reset! gets 0)
+        (pt/scan-range get-fn root nil nil)
+        (let [full @gets]
+          (is (< pruned full)
+              (str "pruned=" pruned " must be < full=" full
+                   " (total-blocks=" total-blocks ")")))))
+    (testing "an empty interval fetches a path, not the tree"
+      (reset! gets 0)
+      (is (= [] (pt/scan-range get-fn root (key-str 500) (key-str 500))))
+      (is (< @gets total-blocks)))
+    (testing "nil bounds are a full ordered scan"
+      (is (= (mapv first entries)
+             (mapv first (pt/scan-range get-fn root nil nil)))))))
+
 (deftest delete-many-is-history-independent
   (let [entries (mapv (fn [i] [(key-str i) i]) (range 2000))
         removed (set (concat (range 0 17) (range 911 938) (range 1980 2000)))
