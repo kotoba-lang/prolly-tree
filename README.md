@@ -39,6 +39,7 @@ on the child's CID string), so tree shape is identical.
 (def root (pt/build-tree put! (sort-by first [["a" 1] ["b" 2] ["c" 3]])))
 (pt/lookup get-fn root "b")                  ;=> 2
 (pt/scan-prefix get-fn root "a")              ;=> [["a" 1]]
+(pt/scan-range get-fn root "a" "c")           ;=> [["a" 1] ["b" 2]]  ; [lo, hi)
 ```
 
 ## Proving one key to someone who has only the root

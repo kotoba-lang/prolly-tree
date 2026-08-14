@@ -197,6 +197,60 @@
               )]
       (vec (walk root-cid)))))
 
+(defn- in-key-range?
+  "True when `k` is in `[lo, hi)`. A nil bound is unbounded."
+  [k lo hi]
+  (and (or (nil? lo) (not (neg? (compare k lo))))
+       (or (nil? hi) (neg? (compare k hi)))))
+
+(defn- range-children
+  "Internal-node children that can hold a key in `[lo, hi)`.
+
+  A child with max-key `mk` owns `(prev-max, mk]`. Skip it when `mk < lo`.
+  Stop when `prev-max >= hi` — every remaining key is `> prev-max`, so
+  outside an exclusive hi. This is the value-range analogue of
+  `scan-prefix`'s prefix prune: the tree is cut in the middle, not scanned
+  then filtered."
+  [children lo hi]
+  (loop [remaining children, prev-max nil, acc []]
+    (if (empty? remaining)
+      acc
+      (let [entry (first remaining)
+            mk (first entry)]
+        (cond
+          (and (some? prev-max) (some? hi) (not (neg? (compare prev-max hi))))
+          acc
+          (and (some? lo) (neg? (compare mk lo)))
+          (recur (rest remaining) mk acc)
+          :else
+          (recur (rest remaining) mk (conj acc entry)))))))
+
+(defn scan-range
+  "All `[k v]` pairs whose key is in `[lo, hi)`, fetching nodes via
+  `(get-fn cid) -> bytes`. `lo` inclusive, `hi` exclusive; a nil bound is
+  unbounded. Key-range pruned the same way `scan-prefix` is: children whose
+  whole span sits below `lo` are skipped, and the walk stops once past `hi`.
+
+  This is the primitive `index-range` and AVET value intervals need.
+  `scan-prefix` cannot express `[\"attr|n0000000010\" \"attr|n0000000050\")`
+  without reading every key under `attr|` and filtering — which is exactly
+  the full-attribute scan this exists to avoid. Keys must already compare
+  as the query range (order-preserving encoding). HMAC-blinded leaf keys
+  do not; those stay on prefix + decrypt + filter.
+
+  Empty tree / nil root → nil (same as `scan-prefix`)."
+  [get-fn root-cid lo hi]
+  (when root-cid
+    (letfn [(walk [cid]
+              (let [node (get-node get-fn cid)]
+                (case (get node "kind")
+                  "leaf" (filterv (fn [[k _]] (in-key-range? k lo hi))
+                                  (get node "entries"))
+                  "internal"
+                  (into [] (mapcat (fn [entry] (walk (child-cid entry))))
+                        (range-children (get node "children") lo hi)))))]
+      (walk root-cid))))
+
 #?(:cljs
    (def ^:private scan-prefix-async-batch-size
      "Max in-flight child fetches at once for `scan-prefix-async`, same
@@ -279,6 +333,29 @@
                                 "internal"
                                 (-> (pmap-async (fn [entry] (walk (child-cid entry)))
                                                 (children-to-walk node))
+                                    (.then (fn [results] (vec (apply concat results))))))))))]
+         (walk root-cid)))))
+
+#?(:cljs
+   (defn scan-range-async
+     "Async counterpart to `scan-range`. Same `[lo, hi)` contract, same
+     child pruning, batched concurrent child fetches like `scan-prefix-async`.
+
+     get-fn: `(get-fn cid) -> js/Promise<bytes>`. → `js/Promise<[[k v] ...]>`."
+     [get-fn root-cid lo hi]
+     (if (nil? root-cid)
+       (js/Promise.resolve [])
+       (letfn [(walk [cid]
+                 (-> (get-fn cid)
+                     (.then #(verified-node cid %))
+                     (.then (fn [node]
+                              (case (get node "kind")
+                                "leaf" (js/Promise.resolve
+                                        (filterv (fn [[k _]] (in-key-range? k lo hi))
+                                                 (get node "entries")))
+                                "internal"
+                                (-> (pmap-async (fn [entry] (walk (child-cid entry)))
+                                                (range-children (get node "children") lo hi))
                                     (.then (fn [results] (vec (apply concat results))))))))))]
          (walk root-cid)))))
 
