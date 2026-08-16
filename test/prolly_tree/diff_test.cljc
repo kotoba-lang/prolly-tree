@@ -82,3 +82,56 @@
           inserted (pt/insert put! get-fn a (key-str 150) "x")]
       (is (= rebuilt inserted) "insert must be root-CID-identical to a full rebuild")
       (is (= (d/diff get-fn a rebuilt) (d/diff get-fn a inserted))))))
+
+(def sync-limits {:max-blocks 1000 :max-bytes 10000000 :max-reads 2000})
+
+(deftest sync-blocks-reconstruct-a-new-root-from-an-old-root
+  (let [sender (mem-store)
+        receiver (mem-store)
+        put-base! (fn [cid bytes]
+                    ((:put! sender) cid bytes)
+                    ((:put! receiver) cid bytes))
+        base-data (fleet 4000 #(str "pin-" %))
+        base (pt/build-tree put-base! base-data)
+        target-data (mapv (fn [[k v]]
+                            (if (#{(key-str 7) (key-str 2000) (key-str 3990)} k)
+                              [k (str v "-moved")]
+                              [k v]))
+                          base-data)
+        target (pt/build-tree (:put! sender) target-data)
+        full (d/sync-blocks* (:get-fn sender) nil target sync-limits)
+        delta (d/sync-blocks* (:get-fn sender) base target sync-limits)]
+    (testing "the plan is root-first and structurally smaller than a full transfer"
+      (is (= target (get-in delta [:blocks 0 :cid])))
+      (is (< (count (:blocks delta)) (count (:blocks full))))
+      (is (< (get-in delta [:stats :bytes]) (get-in full [:stats :bytes]))))
+    (testing "base store plus only planned blocks reads the complete target"
+      (doseq [{:keys [cid bytes]} (:blocks delta)]
+        ((:put! receiver) cid bytes))
+      (is (= target-data
+             (pt/scan-range (:get-fn receiver) target nil nil))))))
+
+(deftest sync-blocks-equal-root-costs-zero-and-limits-fail-closed
+  (let [{:keys [put! get-fn]} (mem-store)
+        root (pt/build-tree put! (fleet 4000 #(str "pin-" %)))]
+    (is (= {:blocks [] :stats {:blocks 0 :bytes 0 :reads 0}}
+           (d/sync-blocks* get-fn root root sync-limits)))
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"block limit exceeded"
+                          (d/sync-blocks* get-fn nil root
+                                          (assoc sync-limits :max-blocks 1))))
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"positive sync limit required"
+                          (d/sync-blocks* get-fn nil root
+                                          (assoc sync-limits :max-reads 0))))))
+
+(deftest sync-blocks-rehash-every-planned-block
+  (let [{:keys [put! get-fn store]} (mem-store)
+        root (pt/build-tree put! (fleet 200 #(str "pin-" %)))
+        original (get @store root)
+        corrupted (assoc (vec original) 0 (bit-xor 0xff (first original)))]
+    (swap! store assoc root #?(:clj (byte-array (map unchecked-byte corrupted))
+                               :cljs (js/Uint8Array. (clj->js corrupted))))
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"block CID mismatch"
+                          (d/sync-blocks* get-fn nil root sync-limits)))))
