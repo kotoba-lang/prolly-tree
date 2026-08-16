@@ -42,6 +42,30 @@ on the child's CID string), so tree shape is identical.
 (pt/scan-range get-fn root "a" "c")           ;=> [["a" 1] ["b" 2]]  ; [lo, hi)
 ```
 
+## IPLD ADL view
+
+The physical leaf/internal block graph is now exposed as an IPLD Advanced Data
+Layout rather than only through Prolly-specific functions:
+
+```clojure
+(require '[prolly-tree.adl :as adl]
+         '[ipld.data-model :as dm]
+         '[ipld.selector :as selector])
+
+(def m (adl/view get-fn root))
+(dm/kind m)                         ;=> :map
+(dm/lookup m "b")                   ;=> 2
+(selector/select m {:selector :explore-fields
+                    :fields {"b" {:selector :matcher}}})
+;;=> [{:path ["b"], :value 2}]
+```
+
+Consumers see one ordinary Data Model Map while `adl/substrate` preserves the
+physical root CID. `prolly-tree.schema/node-schema` validates every decoded
+substrate block as the expected leaf/internal discriminated union before tree
+logic interprets it. This is a runtime schema algebra, not a full IPLD Schema
+DSL parser.
+
 ## Proving one key to someone who has only the root
 
 ```clojure
