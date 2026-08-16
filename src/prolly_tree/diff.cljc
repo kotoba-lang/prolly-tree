@@ -139,3 +139,100 @@
   (let [{:keys [added removed changed]} (diff get-fn root-a root-b)]
     (vec (sort (distinct (concat (map first added) (map first removed)
                                  (map first changed)))))))
+
+(defn- positive-limit! [limits key]
+  (let [value (get limits key)]
+    (when-not (and (integer? value) (pos? value))
+      (throw (ex-info "prolly-tree.diff: positive sync limit required"
+                      {:type :prolly-tree/invalid-limit
+                       :limit key :value value})))
+    value))
+
+(defn- byte-length [bytes]
+  #?(:clj (if (bytes? bytes) (alength ^bytes bytes) (count bytes))
+     :cljs (if (vector? bytes) (count bytes) (.-length bytes))))
+
+(defn sync-blocks*
+  "Plan the target blocks a peer holding `base-root` needs for `target-root`.
+
+  Equal-CID subtrees are skipped without reading them. Returned blocks are
+  root-first and CID verified, so adding them to a store that already contains
+  the complete base tree makes the target root readable. Limits are mandatory:
+  `:max-blocks`, `:max-bytes`, and `:max-reads` all fail closed.
+
+  The result is `{:blocks [{:cid :bytes} ...] :stats ...}`. `:reads` includes
+  both base comparison reads and target reads; transfer counts only target
+  blocks not proven shared by CID."
+  [get-fn base-root target-root limits]
+  (let [max-blocks (positive-limit! limits :max-blocks)
+        max-bytes (positive-limit! limits :max-bytes)
+        max-reads (positive-limit! limits :max-reads)
+        state (atom {:cache {} :reads 0 :sent #{} :blocks [] :bytes 0})
+        read! (fn [cid]
+                (if-let [cached (get-in @state [:cache cid])]
+                  cached
+                  (let [next-reads (inc (:reads @state))]
+                    (when (> next-reads max-reads)
+                      (throw (ex-info "prolly-tree.diff: sync read limit exceeded"
+                                      {:type :prolly-tree/resource-limit
+                                       :limit :max-reads :maximum max-reads})))
+                    (let [bytes (or (get-fn cid)
+                                    (throw (ex-info "prolly-tree.diff: block is missing"
+                                                    {:type :ipld/missing-block :cid cid})))
+                          record {:cid cid :bytes bytes
+                                  :node (verified-node cid bytes)}]
+                      (swap! state #(-> %
+                                        (assoc :reads next-reads)
+                                        (assoc-in [:cache cid] record)))
+                      record))))
+        send! (fn [cid]
+                (when-not (contains? (:sent @state) cid)
+                  (let [{:keys [bytes] :as record} (read! cid)
+                        next-blocks (inc (count (:blocks @state)))
+                        next-bytes (+ (:bytes @state) (byte-length bytes))]
+                    (when (> next-blocks max-blocks)
+                      (throw (ex-info "prolly-tree.diff: sync block limit exceeded"
+                                      {:type :prolly-tree/resource-limit
+                                       :limit :max-blocks :maximum max-blocks})))
+                    (when (> next-bytes max-bytes)
+                      (throw (ex-info "prolly-tree.diff: sync byte limit exceeded"
+                                      {:type :prolly-tree/resource-limit
+                                       :limit :max-bytes :maximum max-bytes})))
+                    (swap! state #(-> %
+                                      (update :sent conj cid)
+                                      (update :blocks conj (select-keys record [:cid :bytes]))
+                                      (assoc :bytes next-bytes))))))]
+    (letfn [(collect-target! [cid]
+              (send! cid)
+              (let [node (:node (read! cid))]
+                (when-not (leaf? node)
+                  (doseq [[_ child] (children node)]
+                    (collect-target! child)))))
+            (walk! [base target]
+              (cond
+                (or (nil? target) (= base target)) nil
+                (nil? base) (collect-target! target)
+                :else
+                (do
+                  (send! target)
+                  (let [base-node (:node (read! base))
+                        target-node (:node (read! target))]
+                    (when-not (leaf? target-node)
+                      (if (leaf? base-node)
+                        (doseq [[_ child] (children target-node)]
+                          (collect-target! child))
+                        (let [base-children (into {} (children base-node))
+                              shared-cids (set (vals base-children))]
+                          (doseq [[max-key child] (children target-node)]
+                            (when-not (contains? shared-cids child)
+                              (walk! (get base-children max-key) child))))))))))]
+      (walk! base-root target-root)
+      {:blocks (:blocks @state)
+       :stats {:blocks (count (:blocks @state))
+               :bytes (:bytes @state)
+               :reads (:reads @state)}})))
+
+(defn sync-blocks
+  "The root-first target block vector from `sync-blocks*`."
+  [get-fn base-root target-root limits]
+  (:blocks (sync-blocks* get-fn base-root target-root limits)))

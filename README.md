@@ -42,6 +42,22 @@ on the child's CID string), so tree shape is identical.
 (pt/scan-range get-fn root "a" "c")           ;=> [["a" 1] ["b" 2]]  ; [lo, hi)
 ```
 
+Structural replication can transfer only target blocks that are not proven
+shared with a base root:
+
+```clojure
+(require '[prolly-tree.diff :as diff])
+
+(def blocks
+  (diff/sync-blocks get-fn old-root new-root
+                    {:max-blocks 1024 :max-bytes 16777216 :max-reads 2048}))
+;; Root-first, CID-verified blocks. Apply them to a store that already holds
+;; old-root and new-root becomes completely readable.
+```
+
+Equal-CID subtrees cost no reads and no transfer. All comparison reads and
+outbound block/byte counts are independently bounded and fail closed.
+
 ## IPLD ADL view
 
 The physical leaf/internal block graph is now exposed as an IPLD Advanced Data
@@ -105,9 +121,8 @@ Portability is real now, not aspirational: the whole dependency chain
 real ClojureScript (shadow-cljs node-test in CI), producing byte-identical
 CIDs on both platforms.
 
-Not in scope for this landing: key-range-pruned scan (current `scan-prefix`
-walks every internal child), tree diff/merge, garbage collection of
-unreferenced nodes.
+Key-range-pruned scans and structural diff/sync are implemented. Merge policy
+and garbage collection of unreferenced nodes remain host/database concerns.
 
 ## Test
 
