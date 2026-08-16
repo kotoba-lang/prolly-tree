@@ -33,7 +33,8 @@
   identical; only the on-block encoding moved."
   (:require [clojure.string :as str]
             [multiformats.core :as mf]
-            [ipld.core :as ipld]))
+            [ipld.core :as ipld]
+            [prolly-tree.schema :as schema]))
 
 (def boundary-bits
   "Chunk boundary fires when the low `boundary-bits` bits of the determinant
@@ -120,7 +121,7 @@
       (throw (ex-info "prolly-tree: block CID mismatch"
                       {:type :ipld/cid-mismatch :expected-cid expected-cid
                        :actual-cid actual})))
-    (ipld/decode bytes)))
+    (schema/unify-node (ipld/decode bytes))))
 
 (defn- get-node [get-fn cid]
   (verified-node cid (get-fn cid)))
