@@ -58,6 +58,50 @@ shared with a base root:
 Equal-CID subtrees cost no reads and no transfer. All comparison reads and
 outbound block/byte counts are independently bounded and fail closed.
 
+## Diffing one window
+
+`diff` answers "what changed anywhere". `range-diff` answers "what changed
+between these two keys", and it is not the first with a filter on it —
+skipping a subtree whose key span cannot reach the window is a second,
+independent pruning, and it fires on subtrees that *did* change.
+
+```clojure
+(diff/range-diff* get-fn old-root new-root "repo/01000" "repo/01010")
+;; {:added [] :removed [] :changed [["repo/01000" "pin-1000" "pin-NEW-1000"]]
+;;  :blocks-read 5 :pruned {:by-cid 0 :by-range 26}}
+```
+
+Measured 2026-08-17 on a 4,000-key tree with 200 keys changed, spread so that
+every leaf is dirty: `diff` reads **40 blocks and returns 200 changes**
+whatever you actually wanted. A caller needing a ten-key window read all 40
+and discarded 199 answers. `range-diff` reads **5**.
+
+That 5 is printed by the call above, not reasoned about. The reasoned figure
+was 4 — a root pair and the one leaf pair holding those keys — and it is
+wrong, because changing 200 values changes leaf CIDs, which changes the
+content-defined boundary decisions above them, so the two trees do not have
+the same fanout and their children do not align one for one. `:by-range` is
+26 rather than the 32 that symmetric trees would give, for the same reason.
+
+`nil` is an open end, so `(range-diff* g a b nil nil)` is `diff*`. The suite
+checks exactly that against 60 pseudo-random windows, because this is a
+function that fails by *dropping* keys and a smaller answer contains nothing
+that says it should have been bigger.
+
+**`:pruned` counts the two skips apart**, and that separation is the test that
+matters: an implementation with the range skip removed is still correct, still
+passes every assertion about what it returned, and on a tree where most
+subtrees differ still looks fast. Only `:by-range` can tell you the window did
+any work.
+
+One thing worth knowing about the shape of these trees, because it bounds what
+the saving can be: internal boundaries are hashed on the child CID at the same
+~1/256 rate, so the tree stays very flat. Measured on this implementation —
+**1,000 keys is a single leaf; 4,000 keys is 17 leaves under one internal
+node; 20,000 keys is 92 leaves, still one internal level.** A window therefore
+costs about two blocks per side, and the saving is in the leaves not read
+rather than in a shortened descent.
+
 ## IPLD ADL view
 
 The physical leaf/internal block graph is now exposed as an IPLD Advanced Data
