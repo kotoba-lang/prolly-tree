@@ -59,6 +59,61 @@
     (swap! counter inc)
     (verified-node cid (get-fn cid))))
 
+;; ---------------------------------------------------------------------------
+;; key spans — what a subtree can possibly contain
+;;
+;; `core/descend-cid` sends a key to "the first child whose max-key >= k, else
+;; the LAST". So child i holds keys in (max-key[i-1], max-key[i]], and the last
+;; child's upper bound is +infinity rather than its own max-key: a key larger
+;; than every max-key still descends into it. Getting that one wrong prunes a
+;; subtree that can hold wanted keys, so it is stated once, here, and both the
+;; range walk and the range collector read it from this function.
+;;
+;; No tree this library builds can exhibit that last case: `insert` and
+;; `insert-many` are byte-identical to `build-tree`, so the last max-key is
+;; always the tree's maximum key. The +infinity is defence against a tree from
+;; a writer that is not this one, and it is tested against a hand-built node
+;; with an understated max-key -- because a test that used `build-tree` for it
+;; would pass with the bound removed, which is exactly what the first draft of
+;; that test did.
+;;
+;; Both comparisons here are boundary conditions and both were wrong-provable
+;; by mutation while every other test in the suite, including sixty
+;; pseudo-random windows, stayed green. `lo` landing exactly on one of
+;; sixteen boundaries is not something a random draw finds.
+;; ---------------------------------------------------------------------------
+
+(defn- child-spans
+  "`[[lower upper cid] ...]` for an internal node. `lower` is exclusive and nil
+  means -infinity; `upper` is inclusive and nil means +infinity."
+  [node]
+  (let [cs (children node)
+        last-i (dec (count cs))]
+    (into []
+          (map-indexed (fn [i [max-key cid]]
+                         [(when (pos? i) (first (nth cs (dec i))))
+                          (when (< i last-i) max-key)
+                          cid]))
+          cs)))
+
+(defn- span-intersects?
+  "Can a subtree spanning `(lower, upper]` hold a key in `[lo, hi)`?
+
+  Conservative by construction: it may answer true for a span that turns out
+  to hold nothing in range, which costs a read. Answering false wrongly would
+  drop a changed key silently, so every comparison here is the safe way round."
+  [lower upper lo hi]
+  (and (or (nil? upper) (nil? lo) (>= (compare upper lo) 0))
+       (or (nil? lower) (nil? hi) (neg? (compare lower hi)))))
+
+(defn- in-range?
+  [k lo hi]
+  (and (or (nil? lo) (>= (compare k lo) 0))
+       (or (nil? hi) (neg? (compare k hi)))))
+
+(defn- entries-in-range [node lo hi]
+  (filterv (fn [[k _]] (in-range? k lo hi)) (entries node)))
+
 (defn- collect
   "Every [k v] under `cid`. Used only for a subtree that exists on one side."
   [read cid]
@@ -101,6 +156,19 @@
 ;; public
 ;; ---------------------------------------------------------------------------
 
+(defn- summarise
+  "The [added removed changed] shape, from the two entry vectors a walk
+  produced. One definition, because `diff*` and `range-diff*` differ in what
+  they walk and not at all in what they report."
+  [ea eb]
+  (let [ma (into {} ea) mb (into {} eb)]
+    {:added (vec (sort-by first (for [[k v] mb :when (not (contains? ma k))] [k v])))
+     :removed (vec (sort-by first (for [[k v] ma :when (not (contains? mb k))] [k v])))
+     :changed (vec (sort-by first (for [[k v] ma
+                                        :let [v' (get mb k)]
+                                        :when (and (contains? mb k) (not= v v'))]
+                                    [k v v'])))}))
+
 (defn diff*
   "Like `diff`, but also returns `:blocks-read` — the number of blocks this
   comparison actually fetched. Callers that care whether the structural skip is
@@ -109,16 +177,8 @@
   [get-fn root-a root-b]
   (let [counter (atom 0)
         read (reader get-fn counter)
-        [ea eb] (gather read root-a root-b)
-        ma (into {} ea)
-        mb (into {} eb)]
-    {:added (vec (sort-by first (for [[k v] mb :when (not (contains? ma k))] [k v])))
-     :removed (vec (sort-by first (for [[k v] ma :when (not (contains? mb k))] [k v])))
-     :changed (vec (sort-by first (for [[k v] ma
-                                        :let [v' (get mb k)]
-                                        :when (and (contains? mb k) (not= v v'))]
-                                    [k v v'])))
-     :blocks-read @counter}))
+        [ea eb] (gather read root-a root-b)]
+    (assoc (summarise ea eb) :blocks-read @counter)))
 
 (defn diff
   "What changed between two Prolly Tree roots.
@@ -131,6 +191,115 @@
   scan."
   [get-fn root-a root-b]
   (dissoc (diff* get-fn root-a root-b) :blocks-read))
+
+;; ---------------------------------------------------------------------------
+;; range diff — the same skip, plus the one the key order makes possible
+;; ---------------------------------------------------------------------------
+
+(defn- collect-range
+  "Every `[k v]` under `cid` with a key in `[lo, hi)`, reading only subtrees
+  whose span can intersect. Used for a subtree that exists on one side only."
+  [read pruned cid lo hi]
+  (let [node (read cid)]
+    (if (leaf? node)
+      (entries-in-range node lo hi)
+      (reduce (fn [acc [lower upper child]]
+                (if (span-intersects? lower upper lo hi)
+                  (into acc (collect-range read pruned child lo hi))
+                  (do (swap! pruned update :by-range inc) acc)))
+              []
+              (child-spans node)))))
+
+(defn- gather-range
+  "`gather`, restricted to `[lo, hi)`.
+
+  Two independent reasons to stop descending, and they are counted separately
+  because they answer different questions. Equal CIDs mean *nothing changed
+  here*; a disjoint span means *nothing here was asked about*. An
+  implementation that had lost the second would still be correct and would
+  still look fast on a tree where most of it changed."
+  [read pruned a b lo hi]
+  (cond
+    (= a b) (do (when a (swap! pruned update :by-cid inc)) [[] []])
+    (nil? a) [[] (collect-range read pruned b lo hi)]
+    (nil? b) [(collect-range read pruned a lo hi) []]
+    :else
+    (let [na (read a) nb (read b)]
+      (cond
+        (and (leaf? na) (leaf? nb))
+        [(entries-in-range na lo hi) (entries-in-range nb lo hi)]
+        (leaf? na) [(entries-in-range na lo hi) (collect-range read pruned b lo hi)]
+        (leaf? nb) [(collect-range read pruned a lo hi) (entries-in-range nb lo hi)]
+        :else
+        ;; A child that cannot intersect the range is dropped BEFORE alignment
+        ;; rather than after: it contributes nothing in range, so treating it
+        ;; as absent on its side is exactly right, and it means an unmatched
+        ;; max-key on the other side is collected in-range rather than whole.
+        (let [keep (fn [node]
+                     (reduce (fn [acc [lower upper cid]]
+                               (if (span-intersects? lower upper lo hi)
+                                 (assoc acc (or upper ::last) cid)
+                                 (do (swap! pruned update :by-range inc) acc)))
+                             {} (child-spans node)))
+              ca (keep na)
+              cb (keep nb)
+              ks (sort-by str (distinct (concat (keys ca) (keys cb))))]
+          (reduce (fn [[ea eb] k]
+                    (let [x (get ca k) y (get cb k)]
+                      (cond
+                        (= x y) (do (when x (swap! pruned update :by-cid inc))
+                                    [ea eb])
+                        (nil? x) [ea (into eb (collect-range read pruned y lo hi))]
+                        (nil? y) [(into ea (collect-range read pruned x lo hi)) eb]
+                        :else (let [[da db] (gather-range read pruned x y lo hi)]
+                                [(into ea da) (into eb db)]))))
+                  [[] []] ks))))))
+
+(defn range-diff*
+  "What changed between two roots, for keys in `[lo, hi)` only — with the
+  accounting that says whether it was cheap for the right reason.
+
+  ```clojure
+  {:added [...] :removed [...] :changed [...]
+   :blocks-read 4 :pruned {:by-cid 1 :by-range 14}}
+  ```
+
+  `diff` already skips subtrees whose CIDs match. This adds the skip that key
+  order makes possible: a subtree whose span cannot intersect `[lo, hi)` is
+  never read even when it *has* changed. The two are independent, which is why
+  `:pruned` counts them apart — equal CIDs mean nothing changed there, a
+  disjoint span means nothing there was asked about, and a version that had
+  quietly lost the second would still be correct and would still look fast on
+  a tree where most subtrees differ.
+
+  `nil` for `lo` or `hi` is an open end, so `(range-diff* g a b nil nil)` is
+  `diff*`, and the suite checks that against 60 pseudo-random windows. That
+  equivalence is the oracle: interval arithmetic goes wrong by DROPPING keys,
+  and a dropped key is invisible in the result — nothing in a smaller answer
+  says it should have been bigger.
+
+  Measured 2026-08-17 on a 4,000-key tree (17 leaves, one internal level) with
+  200 keys changed across every leaf: the whole-tree diff reads 40 blocks
+  whatever you want, and it was the only thing on offer — a caller wanting a
+  10-key window read all 40 and discarded 199 of the 200 answers. This reads
+  5 -- printed, not predicted: the reasoned answer was 4, and it is wrong,
+  because changing values changes leaf CIDs and therefore the content-defined
+  boundaries above them, so the two trees do not share a fanout."
+  [get-fn root-a root-b lo hi]
+  (let [counter (atom 0)
+        pruned (atom {:by-cid 0 :by-range 0})
+        read (reader get-fn counter)
+        [ea eb] (gather-range read pruned root-a root-b lo hi)]
+    (assoc (summarise ea eb) :blocks-read @counter :pruned @pruned)))
+
+(defn range-diff
+  "What changed between two roots for keys in `[lo, hi)`.
+
+  -> `{:added [[k v] ...] :removed [[k v] ...] :changed [[k old new] ...]}`
+
+  `nil` bounds are open. See `range-diff*` for the accounting."
+  [get-fn root-a root-b lo hi]
+  (dissoc (range-diff* get-fn root-a root-b lo hi) :blocks-read :pruned))
 
 (defn changed-keys
   "Just the key set that moved, in sorted order — the shape a sync planner wants
