@@ -161,6 +161,44 @@
           "leaf" (some (fn [[ek ev]] (when (= ek k) ev)) (get node "entries"))
           "internal" (recur (descend-cid (get node "children") k)))))))
 
+(defn- prefix-past?
+  [k prefix]
+  (and (pos? (compare k prefix)) (not (str/starts-with? k prefix))))
+
+(defn- scan-prefix-walk
+  "Recursive prefix walk. `left` is a volatile of remaining matches, or
+  nil when unlimited. Stops descending once the budget is spent."
+  [get-fn cid prefix left]
+  (when (or (nil? left) (pos? @left))
+    (let [node (get-node get-fn cid)]
+      (case (get node "kind")
+        "leaf"
+        (let [ms (filterv (fn [[k _]] (str/starts-with? k prefix))
+                          (get node "entries"))]
+          (if (nil? left)
+            ms
+            (let [got (vec (take @left ms))]
+              (vswap! left - (count got))
+              got)))
+        "internal"
+        (loop [children (get node "children")
+               prev-max nil
+               out (transient [])]
+          (cond
+            (empty? children) (persistent! out)
+            (and left (not (pos? @left))) (persistent! out)
+            :else
+            (let [entry (first children)
+                  mk (first entry)]
+              (cond
+                (and (some? prev-max) (prefix-past? prev-max prefix))
+                (persistent! out)
+                (neg? (compare mk prefix))
+                (recur (rest children) mk out)
+                :else
+                (recur (rest children) mk
+                       (reduce conj! out (or (scan-prefix-walk get-fn (child-cid entry) prefix left) [])))))))))))
+
 (defn scan-prefix
   "All `[k v]` pairs whose string key starts with `prefix`, fetching nodes via
   `(get-fn cid) -> bytes`. Key-range pruned: since keys are sorted and an
@@ -169,34 +207,21 @@
   `max-key` has not already passed the prefix range. So we skip children entirely
   below the prefix and stop once past it — descending into O(path) blocks for a
   keyed read instead of the whole tree (ADR-2607022330 addendum 3 / #16). With an
-  empty `prefix` this is a full ordered scan, unchanged."
-  [get-fn root-cid prefix]
-  (when root-cid
-    (letfn [(past-prefix? [k]
-              ;; k sorts after the prefix AND is not itself within it → the whole
-              ;; remaining (sorted) range is beyond the prefix; stop.
-              (and (pos? (compare k prefix)) (not (str/starts-with? k prefix))))
-            (walk [cid]
-              (let [node (get-node get-fn cid)]
-                (case (get node "kind")
-                  "leaf" (filter (fn [[k _]] (str/starts-with? k prefix))
-                                 (get node "entries"))
-                  "internal"
-                  (loop [children (get node "children"), prev-max nil, out (transient [])]
-                    (if (empty? children)
-                      (persistent! out)
-                      (let [entry (first children)
-                            mk (first entry)]
-                        (cond
-                          ;; predecessor already past the prefix range → done
-                          (and (some? prev-max) (past-prefix? prev-max)) (persistent! out)
-                          ;; this child's whole range is below the prefix → skip
-                          (neg? (compare mk prefix)) (recur (rest children) mk out)
-                          ;; may contain matches → descend
-                          :else (recur (rest children) mk
-                                       (reduce conj! out (walk (child-cid entry))))))))))
-              )]
-      (vec (walk root-cid)))))
+  empty `prefix` this is a full ordered scan, unchanged.
+
+  Optional `limit` (positive int) stops after that many matching pairs.
+  `nil` is unlimited. `0` or negative is empty without walking. A caller
+  that takes `limit` after a full scan still paid O(tree); this is the
+  bound that makes `datoms` `:limit 1` O(path), not O(database)."
+  ([get-fn root-cid prefix]
+   (scan-prefix get-fn root-cid prefix nil))
+  ([get-fn root-cid prefix limit]
+   (when root-cid
+     (if (and (some? limit) (not (pos? limit)))
+       []
+       (vec (or (scan-prefix-walk get-fn root-cid prefix
+                                  (when (some? limit) (volatile! limit)))
+                []))))))
 
 (defn- in-key-range?
   "True when `k` is in `[lo, hi)`. A nil bound is unbounded."
@@ -280,7 +305,7 @@
                batches))))
 
 #?(:cljs
-   (defn scan-prefix-async
+   (defn- scan-prefix-async-full
      "Async, concurrency-batched counterpart to `scan-prefix`, for a `get-fn`
      that returns a `js/Promise<bytes>` (fetches over the network, e.g. R2)
      rather than the synchronous get-fn/block-miss-trampoline contract
@@ -336,6 +361,63 @@
                                                 (children-to-walk node))
                                     (.then (fn [results] (vec (apply concat results))))))))))]
          (walk root-cid)))))
+
+#?(:cljs
+   (defn- scan-prefix-async-limited
+     [get-fn root-cid prefix limit]
+     (cond
+       (nil? root-cid) (js/Promise.resolve [])
+       (not (pos? limit)) (js/Promise.resolve [])
+       :else
+       (let [left (volatile! limit)
+             past-prefix? (fn [k]
+                            (and (pos? (compare k prefix))
+                                 (not (str/starts-with? k prefix))))
+             take-matching (fn [entries]
+                             (let [ms (filterv (fn [[k _]] (str/starts-with? k prefix)) entries)
+                                   got (vec (take @left ms))]
+                               (vswap! left - (count got))
+                               got))
+             children-to-walk (fn [node]
+                                (loop [children (get node "children")
+                                       prev-max nil
+                                       acc []]
+                                  (if (empty? children)
+                                    acc
+                                    (let [entry (first children)
+                                          mk (first entry)]
+                                      (cond
+                                        (and (some? prev-max) (past-prefix? prev-max)) acc
+                                        (neg? (compare mk prefix)) (recur (rest children) mk acc)
+                                        :else (recur (rest children) mk (conj acc entry)))))))
+             walk (fn walk [cid]
+                    (if-not (pos? @left)
+                      (js/Promise.resolve [])
+                      (-> (get-fn cid)
+                          (.then (fn [bytes] (verified-node cid bytes)))
+                          (.then (fn [node]
+                                   (if (= "leaf" (get node "kind"))
+                                     (js/Promise.resolve (take-matching (get node "entries")))
+                                     (reduce (fn [p entry]
+                                               (.then p (fn [acc]
+                                                          (if-not (pos? @left)
+                                                            acc
+                                                            (.then (walk (child-cid entry))
+                                                                   (fn [more] (into acc more)))))))
+                                             (js/Promise.resolve [])
+                                             (children-to-walk node))))))))]
+         (walk root-cid)))))
+
+#?(:cljs
+   (defn scan-prefix-async
+     "Async counterpart to `scan-prefix`. Optional `limit` walks children
+     left-to-right and stops; `nil` keeps the batched-concurrent full walk."
+     ([get-fn root-cid prefix]
+      (scan-prefix-async-full get-fn root-cid prefix))
+     ([get-fn root-cid prefix limit]
+      (if (nil? limit)
+        (scan-prefix-async-full get-fn root-cid prefix)
+        (scan-prefix-async-limited get-fn root-cid prefix limit)))))
 
 #?(:cljs
    (defn scan-range-async

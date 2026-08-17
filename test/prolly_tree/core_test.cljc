@@ -99,6 +99,27 @@
       (is (= [] (pt/scan-prefix get-fn root "nope/")))
       (is (< @gets total-blocks) "absent-prefix scan is pruned, not a full walk"))))
 
+(deftest scan-prefix-limit-stops-the-walk
+  (let [store (atom {})
+        gets  (atom 0)
+        put!  (fn [cid bytes] (swap! store assoc cid bytes))
+        get-fn (fn [cid] (swap! gets inc) (get @store cid))
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+        root (pt/build-tree put! entries)
+        full-keys (mapv first (pt/scan-prefix get-fn root ""))]
+    (reset! gets 0)
+    (let [one (pt/scan-prefix get-fn root "" 1)
+          limited-gets @gets]
+      (is (= [(first full-keys)] (mapv first one)))
+      (reset! gets 0)
+      (pt/scan-prefix get-fn root "")
+      (let [full-gets @gets]
+        (is (< limited-gets full-gets)
+            (str "limit=1 gets=" limited-gets " must be < full gets=" full-gets))))
+    (is (= (take 5 full-keys) (mapv first (pt/scan-prefix get-fn root "" 5))))
+    (is (= [] (pt/scan-prefix get-fn root "" 0)))
+    (is (empty? (or (pt/scan-prefix get-fn nil "" 1) [])))))
+
 (deftest scan-range-cuts-the-tree-not-the-result
   ;; Value-interval analogue of `scan-prefix-prunes-blocks`. A `[lo, hi)`
   ;; walk must return the same pairs as filtering a full scan, and must
@@ -253,6 +274,27 @@
                           (str "each of the " total-blocks " blocks is fetched EXACTLY once, "
                                "not re-fetched/re-decoded per retry (actual gets=" @gets ")"))
                       (done))))))))
+
+#?(:cljs
+   (deftest scan-prefix-async-limit-stops-the-walk
+     (async done
+       (let [{:keys [put! get-fn gets store]} (async-mem-store)
+             sync-get-fn (fn [cid] (get @store cid))
+             entries (sort-by first (map (fn [i] [(key-str i) (str "v" i)]) (range 2000)))
+             root (pt/build-tree put! entries)
+             want (mapv first (pt/scan-prefix sync-get-fn root "" 1))]
+         (reset! gets 0)
+         (-> (pt/scan-prefix-async get-fn root "" 1)
+             (.then (fn [rows]
+                      (let [limited-gets @gets]
+                        (is (= want (mapv first rows)))
+                        (reset! gets 0)
+                        (-> (pt/scan-prefix-async get-fn root "")
+                            (.then (fn [_]
+                                     (is (< limited-gets @gets)
+                                         (str "limit=1 gets=" limited-gets
+                                              " must be < full gets=" @gets))
+                                     (done))))))))))))
 
 #?(:cljs
    (deftest async-tree-read-rejects-bytes-stored-under-wrong-cid
