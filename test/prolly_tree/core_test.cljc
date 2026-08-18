@@ -307,7 +307,18 @@
               root "")
              (.then (fn [_] (is false "wrong-CID bytes must reject") (done)))
              (.catch (fn [e]
-                       (is (= :ipld/cid-mismatch (:type (ex-data e))))
+                       ;; Both levels, because nbb wraps and compiled
+                       ;; ClojureScript does not. SCI rethrows anything raised
+                       ;; inside a promise callback as its own `{:type
+                       ;; :sci/error …}` and hangs the original off `ex-cause`;
+                       ;; on a compiled build (and on the JVM) there is no
+                       ;; wrapper and the cause is nil. Measured 2026-08-18 --
+                       ;; asserting only the top level made this the one red
+                       ;; test in an otherwise green nbb run, for a difference
+                       ;; that does not exist in the Worker this ships to.
+                       (let [types (keep #(:type (ex-data %)) [e (ex-cause e)])]
+                         (is (some #{:ipld/cid-mismatch} types)
+                             (str "expected :ipld/cid-mismatch, saw " (pr-str types))))
                        (done))))))))
 
 #?(:cljs
