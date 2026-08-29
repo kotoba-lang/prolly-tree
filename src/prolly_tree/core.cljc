@@ -15,7 +15,7 @@
   implementation hit and fixed.
 
   Update: `multiformats.core/sha256` and `cbor.core/encode` have grown real
-  `:cljs` branches (SHA-256 via @noble/hashes, portable CBOR byte buffers).
+  `:cljs` branches (SHA-256 via org-nist-sha2 through io-multiformats, portable CBOR byte buffers).
   `utf8-bytes` below used `.getBytes` unconditionally despite the `.cljc`
   extension -- a genuine gap in this namespace's own portability, not just
   its dependencies' -- now split per-platform. Verified end to end under
