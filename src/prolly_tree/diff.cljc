@@ -20,7 +20,8 @@
 
   `get-fn` is the same block-reading port `prolly-tree.core` takes: `(get-fn
   cid) -> bytes`. Nothing here does I/O of its own."
-  (:require [ipld.core :as ipld]))
+  (:require [ipld.core :as ipld]
+            [prolly-tree.core :as core]))
 
 ;; ---------------------------------------------------------------------------
 ;; node access — deliberately duplicated from core rather than exported from it,
@@ -62,39 +63,25 @@
 ;; ---------------------------------------------------------------------------
 ;; key spans — what a subtree can possibly contain
 ;;
-;; `core/descend-cid` sends a key to "the first child whose max-key >= k, else
-;; the LAST". So child i holds keys in (max-key[i-1], max-key[i]], and the last
-;; child's upper bound is +infinity rather than its own max-key: a key larger
-;; than every max-key still descends into it. Getting that one wrong prunes a
-;; subtree that can hold wanted keys, so it is stated once, here, and both the
-;; range walk and the range collector read it from this function.
+;; The span arithmetic itself — child i holds keys in (max-key[i-1],
+;; max-key[i]], and the LAST child's upper bound is +infinity — now lives once,
+;; in `core/child-spans`, next to the `descend-cid` rule it encodes. This
+;; namespace read it from a private copy until `core/verify-range` needed the
+;; same sentence; two copies of one boundary condition is how a verifier and a
+;; prover come to disagree. Node ACCESS stays duplicated below, for the reason
+;; stated above; the spans do not.
 ;;
-;; No tree this library builds can exhibit that last case: `insert` and
-;; `insert-many` are byte-identical to `build-tree`, so the last max-key is
-;; always the tree's maximum key. The +infinity is defence against a tree from
-;; a writer that is not this one, and it is tested against a hand-built node
-;; with an understated max-key -- because a test that used `build-tree` for it
-;; would pass with the bound removed, which is exactly what the first draft of
-;; that test did.
+;; What is stated here instead is the CONSERVATISM, which is this namespace's
+;; and not shared: `core/range-spans` prunes the last child on its claimed
+;; max-key, and this prunes it on +infinity, so the two answer differently on a
+;; tree no `build-tree` can produce. `the-last-child-is-unbounded-above` covers
+;; this side; `core/verify-range`'s docstring covers the other.
 ;;
 ;; Both comparisons here are boundary conditions and both were wrong-provable
 ;; by mutation while every other test in the suite, including sixty
 ;; pseudo-random windows, stayed green. `lo` landing exactly on one of
 ;; sixteen boundaries is not something a random draw finds.
 ;; ---------------------------------------------------------------------------
-
-(defn- child-spans
-  "`[[lower upper cid] ...]` for an internal node. `lower` is exclusive and nil
-  means -infinity; `upper` is inclusive and nil means +infinity."
-  [node]
-  (let [cs (children node)
-        last-i (dec (count cs))]
-    (into []
-          (map-indexed (fn [i [max-key cid]]
-                         [(when (pos? i) (first (nth cs (dec i))))
-                          (when (< i last-i) max-key)
-                          cid]))
-          cs)))
 
 (defn- span-intersects?
   "Can a subtree spanning `(lower, upper]` hold a key in `[lo, hi)`?
@@ -208,7 +195,7 @@
                   (into acc (collect-range read pruned child lo hi))
                   (do (swap! pruned update :by-range inc) acc)))
               []
-              (child-spans node)))))
+              (core/child-spans node)))))
 
 (defn- gather-range
   "`gather`, restricted to `[lo, hi)`.
@@ -240,7 +227,7 @@
                                (if (span-intersects? lower upper lo hi)
                                  (assoc acc (or upper ::last) cid)
                                  (do (swap! pruned update :by-range inc) acc)))
-                             {} (child-spans node)))
+                             {} (core/child-spans node)))
               ca (keep na)
               cb (keep nb)
               ks (sort-by str (distinct (concat (keys ca) (keys cb))))]

@@ -17,7 +17,8 @@
             [prolly-tree.diff-test]
             [prolly-tree.insert-test]
             [prolly-tree.proof-test]
-            [prolly-tree.range-diff-test]))
+            [prolly-tree.range-diff-test]
+            [prolly-tree.verify-range-test]))
 
 (defmethod t/report [::t/default :end-run-tests] [m]
   (when-not (t/successful? m)
