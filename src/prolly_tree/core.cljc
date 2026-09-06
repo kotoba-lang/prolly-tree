@@ -149,6 +149,43 @@
             children)
       (child-cid (last children))))
 
+;; ---------------------------------------------------------------------------
+;; key spans -- what a subtree can possibly contain
+;;
+;; `descend-cid` above sends a key to "the first child whose max-key >= k, else
+;; the LAST". So child i holds keys in (max-key[i-1], max-key[i]], and the last
+;; child's upper bound is +infinity rather than its own max-key: a key larger
+;; than every max-key still descends into it. Getting that one wrong prunes a
+;; subtree that can hold wanted keys, so it is stated once, here, and every
+;; range walk in this library reads it from this function.
+;;
+;; No tree this library builds can exhibit that last case: `insert` and
+;; `insert-many` are byte-identical to `build-tree`, so the last max-key is
+;; always the tree's maximum key. The +infinity is defence against a tree from
+;; a writer that is not this one, and `prolly-tree.range-diff-test` tests it
+;; against a hand-built node with an understated max-key -- because a test that
+;; used `build-tree` for it would pass with the bound removed, which is exactly
+;; what the first draft of that test did.
+;;
+;; This lived in `prolly-tree.diff` until `verify-range` needed it. A verifier
+;; that restated the span arithmetic would be a fourth copy of one sentence,
+;; and the copy that drifts is the one that accepts the wrong answer.
+;; ---------------------------------------------------------------------------
+
+(defn child-spans
+  "`[[lower upper cid] ...]` for an internal node, in key order. `lower` is
+  EXCLUSIVE and nil means -infinity; `upper` is INCLUSIVE and nil means
+  +infinity, which only the last child gets."
+  [node]
+  (let [cs (get node "children")
+        last-i (dec (count cs))]
+    (into []
+          (map-indexed (fn [i entry]
+                         [(when (pos? i) (first (nth cs (dec i))))
+                          (when (< i last-i) (first entry))
+                          (child-cid entry)]))
+          cs)))
+
 (defn lookup
   "Point lookup of `k` under `root-cid`, fetching nodes via `(get-fn cid) ->
   bytes`. Returns the value, or nil if `k` is absent or `root-cid` is nil
@@ -229,27 +266,52 @@
   (and (or (nil? lo) (not (neg? (compare k lo))))
        (or (nil? hi) (neg? (compare k hi)))))
 
-(defn- range-children
-  "Internal-node children that can hold a key in `[lo, hi)`.
+(defn- range-spans
+  "The child spans a range walk over `[lo, hi)` descends into, from
+  `child-spans`.
 
-  A child with max-key `mk` owns `(prev-max, mk]`. Skip it when `mk < lo`.
-  Stop when `prev-max >= hi` — every remaining key is `> prev-max`, so
-  outside an exclusive hi. This is the value-range analogue of
-  `scan-prefix`'s prefix prune: the tree is cut in the middle, not scanned
-  then filtered."
-  [children lo hi]
-  (loop [remaining children, prev-max nil, acc []]
-    (if (empty? remaining)
-      acc
-      (let [entry (first remaining)
-            mk (first entry)]
+  One function because `scan-range` (the prover) and `verify-range` (the
+  verifier) must prune IDENTICALLY. A verifier that follows a different rule
+  from the prover refuses honest answers, or accepts short ones -- the same
+  argument `descend-cid` makes for point lookups, one dimension up.
+
+  A child with claimed max-key `mk` owns `(prev-max, mk]`. Skip it when
+  `mk < lo`. Stop when `prev-max >= hi` -- every remaining key is
+  `> prev-max`, so outside an exclusive hi. This is the value-range analogue
+  of `scan-prefix`'s prefix prune: the tree is cut in the middle, not scanned
+  then filtered.
+
+  Two things here differ from `prolly-tree.diff`'s `span-intersects?`, which
+  reads the same spans, and both differences are deliberate:
+
+  1. This STOPS at the first child whose `lower` has reached `hi` instead of
+     filtering. `lower` is non-decreasing across a node's children, so on any
+     tree with sorted max-keys the two agree; on one without, stopping is what
+     `scan-range` does and therefore what a verifier must reproduce.
+
+  2. The `lo` test uses the child's CLAIMED max-key, not the span's `upper`.
+     They are the same except for the LAST child, where `upper` is nil for
+     +infinity. `diff` honours that +infinity and keeps a last child whose
+     max-key is understated; `scan-range` does not, and skips it. So the two
+     namespaces answer differently on a tree no `build-tree` can produce --
+     `diff` conservatively, `scan-range` by trusting the claim. That trust is
+     exactly what `verify-range` cannot verify away, and
+     `the-last-childs-claim-is-trusted-too-and-diff-disagrees` is the test
+     that says so -- it is also the only test the difference in (2) can
+     redden, because `upper` and the claimed max-key are the same value for
+     every child except the last."
+  [node lo hi]
+  (let [claimed (mapv first (get node "children"))]
+    (loop [spans (child-spans node), i 0, acc []]
+      (if-let [[lower _ _ :as span] (first spans)]
         (cond
-          (and (some? prev-max) (some? hi) (not (neg? (compare prev-max hi))))
+          (and (some? lower) (some? hi) (not (neg? (compare lower hi))))
           acc
-          (and (some? lo) (neg? (compare mk lo)))
-          (recur (rest remaining) mk acc)
+          (and (some? lo) (neg? (compare (nth claimed i) lo)))
+          (recur (rest spans) (inc i) acc)
           :else
-          (recur (rest remaining) mk (conj acc entry)))))))
+          (recur (rest spans) (inc i) (conj acc span)))
+        acc))))
 
 (defn scan-range
   "All `[k v]` pairs whose key is in `[lo, hi)`, fetching nodes via
@@ -273,8 +335,8 @@
                   "leaf" (filterv (fn [[k _]] (in-key-range? k lo hi))
                                   (get node "entries"))
                   "internal"
-                  (into [] (mapcat (fn [entry] (walk (child-cid entry))))
-                        (range-children (get node "children") lo hi)))))]
+                  (into [] (mapcat (fn [[_ _ cid]] (walk cid)))
+                        (range-spans node lo hi)))))]
       (walk root-cid))))
 
 #?(:cljs
@@ -437,8 +499,8 @@
                                         (filterv (fn [[k _]] (in-key-range? k lo hi))
                                                  (get node "entries")))
                                 "internal"
-                                (-> (pmap-async (fn [entry] (walk (child-cid entry)))
-                                                (range-children (get node "children") lo hi))
+                                (-> (pmap-async (fn [[_ _ cid]] (walk cid))
+                                                (range-spans node lo hi))
                                     (.then (fn [results] (vec (apply concat results))))))))))]
          (walk root-cid)))))
 
@@ -527,6 +589,133 @@
             "internal" (when (some? more)
                          (recur (descend-cid (get node "children") k) more))
             nil))))))
+
+;; ── Range proof ─────────────────────────────────────────────────────────────
+;;
+;; What a range proof for this tree can be, and what it cannot -- and the gap
+;; between the two is the whole point of stating it here.
+;;
+;; `verify` above proves ONE pair. The natural next question from a caller who
+;; has only the root is "and is that ALL of them, between these two keys?", and
+;; the honest answer splits in two:
+;;
+;;   PROVABLE, from the blocks and nothing else: "this is what `scan-range`
+;;   returns for `[lo, hi)` under this root". An internal node carries EVERY
+;;   child's [max-key, link] inside the bytes its own CID names, so a verifier
+;;   holding the root can recompute, at every level, exactly which children the
+;;   pruning rule keeps -- and then demand each one. It costs no extra bytes:
+;;   the answer is a function of the blocks the prover already had to read.
+;;
+;;   NOT PROVABLE: "this is every fact in `[lo, hi)`". That claim needs the
+;;   tree to be well-formed -- keys sorted end to end, every max-key actually
+;;   maximal -- and no block contains that. It is the same wall the note above
+;;   `inclusion-proof` hits for absence, and for the same reason: a max-key is
+;;   the PROVER's claim about a subtree, so pruning on it is trusting the
+;;   prover. A prover that understates one max-key hides every key above it in
+;;   that subtree, the verifier prunes in exactly the same place, and the short
+;;   answer verifies. `an-understated-max-key-hides-a-key-and-the-proof-is-
+;;   still-accepted` asserts that acceptance on purpose. It is the boundary of
+;;   what this can claim, not a bug to fix here -- fixing it needs a different
+;;   commitment (max-keys signed by, or derived from, something the prover does
+;;   not choose), not a different verifier.
+;;
+;; So: `verify-range` is an equivalence proof against a named function, not a
+;; completeness proof against the world.
+
+(defn- byte-count [bytes]
+  #?(:clj (if (bytes? bytes) (alength ^bytes bytes) (count bytes))
+     :cljs (if (vector? bytes) (count bytes) (.-length bytes))))
+
+(defn- index-blocks
+  "`{cid bytes}` for a range proof, keyed by RE-HASHING every block.
+
+  No CID in the result came from the caller, which is why `verify-range` has
+  no CID-mismatch refusal: a block whose bytes were changed does not become a
+  different truth about the CID it was filed under, it becomes a block nobody
+  asked for, and the block that was asked for is missing."
+  [blocks]
+  (persistent!
+   (reduce (fn [acc bytes] (assoc! acc (ipld/cid bytes) bytes))
+           (transient {}) blocks)))
+
+(defn- in-span?
+  "`lower` exclusive (nil = -infinity), `upper` inclusive (nil = +infinity) --
+  the convention `child-spans` states."
+  [k lower upper]
+  (and (or (nil? lower) (pos? (compare k lower)))
+       (or (nil? upper) (not (pos? (compare k upper))))))
+
+(defn verify-range
+  "Check that `blocks` prove the answer `scan-range` gives for `[lo, hi)` under
+  `root-cid`, and return
+
+      {:entries [[k v] ...] :blocks n :bytes n}
+
+  -- or throw a typed refusal. Returns nil for a nil `root-cid`, so
+  `(:entries ...)` is nil there, matching `scan-range` on the empty tree.
+
+  `root-cid`, `lo` and `hi` come from the CALLER. None of them is read out of
+  `blocks`, and neither is any CID: `index-blocks` re-hashes. A verifier that
+  reads what it is checking against out of the thing being checked verifies
+  nothing, which is the same reason `verify` takes `root-cid` and `k`.
+
+  No I/O. `:blocks` and `:bytes` are what the proof actually needed, reported
+  rather than left to be assumed -- a range proof whose cost nobody counted is
+  a range proof nobody knows the price of, and `prolly-tree.diff` already makes
+  that argument for its block counter.
+
+  WHAT IT PROVES: the entries are exactly `(scan-range get-fn root-cid lo hi)`.
+  WHAT IT DOES NOT: that those are every fact in the range. See the note above.
+
+  Each refusal is typed and named apart, and each has a test:
+
+  | `:prolly-tree/block-missing`        | the proof omits a block the pruning rule keeps -- also how a tampered or substituted block arrives, since the index is built by hashing |
+  | `:prolly-tree/unexpected-block`     | the proof carries a block the pruning rule never asks for |
+  | `:prolly-tree/entry-outside-span`   | a leaf holds a key outside the `(lower, upper]` its own parent claims for it |
+
+  The third is the only well-formedness this can check, and it is worth being
+  precise about its reach: it is checked against the IMMEDIATE parent's claim,
+  and only for blocks the proof actually contains. A subtree that the rule
+  pruned is never read, so a lie about ITS max-key is out of reach here by
+  construction -- which is exactly the C2 boundary above. Re-checking an
+  internal node's max-keys against its own parent's would add code that only
+  compares one prover claim to another."
+  [root-cid lo hi blocks]
+  (if (nil? root-cid)
+    (when (seq blocks)
+      (throw (ex-info "prolly-tree: range proof for the empty tree carries blocks"
+                      {:type :prolly-tree/unexpected-block
+                       :cids (vec (keys (index-blocks blocks)))})))
+    (let [index (index-blocks blocks)
+          visited (volatile! #{})
+          demand (fn [cid]
+                   (or (get index cid)
+                       (throw (ex-info "prolly-tree: range proof omits a block the pruning rule keeps"
+                                       {:type :prolly-tree/block-missing :cid cid}))))]
+      (letfn [(walk [cid lower upper]
+                (let [bytes (demand cid)
+                      node (schema/unify-node (ipld/decode bytes))]
+                  (vswap! visited conj cid)
+                  (case (get node "kind")
+                    "leaf"
+                    (let [entries (mapv vec (get node "entries"))]
+                      (doseq [[k _] entries]
+                        (when-not (in-span? k lower upper)
+                          (throw (ex-info "prolly-tree: leaf holds a key outside the span its parent claims"
+                                          {:type :prolly-tree/entry-outside-span
+                                           :cid cid :key k :lower lower :upper upper}))))
+                      (filterv (fn [[k _]] (in-key-range? k lo hi)) entries))
+                    "internal"
+                    (into [] (mapcat (fn [[l u c]] (walk c l u)))
+                          (range-spans node lo hi)))))]
+        (let [entries (walk root-cid nil nil)
+              surplus (remove @visited (keys index))]
+          (when (seq surplus)
+            (throw (ex-info "prolly-tree: range proof carries a block the pruning rule never asks for"
+                            {:type :prolly-tree/unexpected-block :cids (vec surplus)})))
+          {:entries entries
+           :blocks (count @visited)
+           :bytes (reduce + 0 (map (comp byte-count index) @visited))})))))
 
 ;; ── Incremental insert ──────────────────────────────────────────────────────
 ;;

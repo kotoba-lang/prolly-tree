@@ -158,6 +158,76 @@ cannot establish that. Inclusion needs no such assumption: the verifier sees
 the pair inside a block it hashed itself. `inclusion-proof` returning nil
 means "no proof to hand out", not "absent".
 
+## Proving one window to someone who has only the root
+
+```clojure
+;; a prover records the blocks its own scan read -- that IS the proof
+(def touched (atom {}))
+(def recording (fn [cid] (let [b (get-fn cid)] (swap! touched assoc cid b) b)))
+
+(def answer (pt/scan-range recording root "key-0100" "key-0400"))
+
+(pt/verify-range root "key-0100" "key-0400" (vals @touched))
+;;=> {:entries [...] :blocks 3 :bytes 90211}
+;;   (:entries) = answer
+```
+
+`verify-range` does no I/O and takes `root-cid`, `lo` and `hi` from its caller,
+like `verify`. It takes no CIDs at all: the archive is indexed by re-hashing
+every block, so a substituted block cannot be a lie about which CID it sits
+under — it decomposes into an omission and a surplus, and both are refused.
+
+**What it proves is narrower than it first looks, and the difference is the
+whole point.**
+
+| claim | provable from these blocks? |
+|---|---|
+| the answer equals what `scan-range` returns for this root | **yes**, and at zero extra cost |
+| the answer is every fact in `[lo, hi)` | **no**, and no quantity of blocks from this tree can make it so |
+
+The first holds because an internal node carries **every** child's
+`[max-key, link]` inside the bytes its own CID names. A verifier holding only
+the root can therefore recompute, at every level, exactly which children the
+pruning rule keeps, and demand each one — so a prover cannot answer with fewer
+blocks than it read, or with different ones.
+
+Measured over 120 pseudo-random and boundary-exact windows on a 4,000-key
+tree: `scan-range` touched **873 blocks / 2,547,074 bytes** on the JVM, and
+`verify-range` needed **exactly the same blocks and the same bytes — zero
+extra**. Under ClojureScript the same suite reports 852 / 2,458,423, and the
+difference is not a discrepancy: the shared pseudo-random helper multiplies
+past 2^53, so cljs doubles and JVM longs part company at the first step and the
+two runtimes sample different windows. Two independent samples, both zero
+extra. That is block bytes; a CARv1 carrying them adds a header, and per block
+a varint length and the binary CID, which is the container's cost and not the
+proof's.
+
+Also measured, on a hand-built tree whose LAST child's max-key is understated:
+`scan-range` and `verify-range` agree on **0 rows**, while `diff/range-diff`,
+walking the same root under the conservative rule, finds **313**.
+
+The second fails because pruning turns on a `max-key`, and a `max-key` is the
+**prover's claim** about a subtree. `an-understated-max-key-hides-a-key-and-the-
+proof-is-still-accepted` builds a tree `build-tree` cannot produce, where one
+max-key is understated and the subtree behind it really does hold every key in
+the window. The prover prunes there; an honest verifier prunes in exactly the
+same place, because a verifier that pruned anywhere else would refuse honest
+proofs; and the empty answer verifies. That acceptance is asserted on purpose
+and is not a defect to fix in the verifier — closing it needs a different
+commitment (max-keys derived from, or signed by, something the prover does not
+choose), not a stricter check.
+
+Being conservative instead does not help, and the suite says so rather than
+leaving it to be assumed: `prolly-tree.diff` already prunes the last child on
+the span's `+infinity` rather than on its claimed max-key, so on that same
+doctored tree `range-diff` finds the hidden rows and `scan-range` does not. A
+verifier that borrowed that rule would demand a block the prover never read,
+and every honest proof would be refused.
+
+So: **`verify-range` is an equivalence proof against a named function, not a
+completeness proof against the world.** Absence is still not provable here, for
+the reason `inclusion-proof` already gives.
+
 ## Scope
 
 Portability is real now, not aspirational: the whole dependency chain
