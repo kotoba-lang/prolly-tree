@@ -1,7 +1,12 @@
 {:paths ["src"]
  ;; multiformats stays a direct dep (boundary hashing); node encode/decode
  ;; goes through ipld (tag-42 links), which brings dag-cbor transitively.
- :deps {io.github.kotoba-lang/io-multiformats {:git/sha "561fe7dfada3db852b127f06d41750dabd3cead9"}
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+       io.github.kotoba-lang/io-multiformats {:git/sha "561fe7dfada3db852b127f06d41750dabd3cead9"}
         io.github.kotoba-lang/io-ipld {:git/sha "48ba40490cf082a1473986ac757b8e2b214a3d1b"}
         ;; The OrderedMap contract this substrate declares itself against.
         ;; It is zero-dependency on purpose -- it holds vocabulary and an

@@ -2,7 +2,7 @@
   (:require #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
             [prolly-tree.core :as pt]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [ipld.core :as ipld]))
 
 (defn- mem-store []
