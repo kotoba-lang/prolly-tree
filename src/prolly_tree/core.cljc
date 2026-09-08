@@ -31,7 +31,7 @@
   consumed the old format (see superproject ADR). Boundary math is
   unchanged (still keyed on the child's CID string), so tree SHAPE is
   identical; only the on-block encoding moved."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [multiformats.core :as mf]
             [ipld.core :as ipld]
             [prolly-tree.schema :as schema]))
