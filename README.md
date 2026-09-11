@@ -241,7 +241,7 @@ and garbage collection of unreferenced nodes remain host/database concerns.
 ## Test
 
 ```bash
-clojure -M:test                     # JVM
+kbb -M:test                     # JVM
 npm install && npm run test:cljs    # real ClojureScript (shadow-cljs node-test)
 ```
 
