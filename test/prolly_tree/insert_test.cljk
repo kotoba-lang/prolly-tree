@@ -8,7 +8,7 @@
   layer -- CAS, dedup, replication -- is quietly wrong. So the property is
   asserted directly, over randomized key sets and insertion orders, rather than
   spot-checked on a hand-picked example."
-  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
             [prolly-tree.core :as pt]))
 
