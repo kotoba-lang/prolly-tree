@@ -11,7 +11,7 @@
   Enough keys to force more than one leaf, because a single-leaf tree never
   exercises the child pruning where a bound is compared against a subtree
   span rather than a key."
-  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [kotobase.storage.ordered-map :as om]
             [prolly-tree.core :as pt]

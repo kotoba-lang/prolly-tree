@@ -7,7 +7,7 @@
   the result. That the answer is CHEAP is checked with block counters, because
   a range walk that quietly read the whole tree and filtered at the end would
   satisfy every correctness assertion here."
-  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [ipld.core :as ipld]
             [prolly-tree.core :as pt]

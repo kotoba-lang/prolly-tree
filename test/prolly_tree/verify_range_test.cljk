@@ -72,7 +72,7 @@
   assertion about what it returned. `arrangement`'s suite makes the same
   argument for counting BYTES and not only blocks: a block count with no byte
   count is half a claim."
-  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [ipld.core :as ipld]
             [prolly-tree.core :as pt]

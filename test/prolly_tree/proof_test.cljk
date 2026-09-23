@@ -11,7 +11,7 @@
   red, and with the descent check weakened to `accept any genuine child`
   `a-shadow-path-to-a-second-copy-of-the-key` goes red. A refusal nobody has
   watched fail is a refusal nobody has tested."
-  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer [deftest is testing] :include-macros true])
             [prolly-tree.core :as pt]
             [ipld.core :as ipld]))
